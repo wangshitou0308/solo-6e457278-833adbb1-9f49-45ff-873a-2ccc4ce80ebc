@@ -22,6 +22,8 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
+/* 防止自定义 display 样式覆盖原生 hidden（遮罩/选区工具条常显问题） */
+[hidden] { display: none !important; }
 body {
   font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   background: var(--bg);
@@ -99,23 +101,28 @@ input[type="number"] { width: 64px; }
 .board-scroll {
   flex: 1;
   overflow: auto;
-  padding: 14px 18px;
+  padding: 10px 18px 14px;
   position: relative;
 }
+.board-legend {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.board-legend b { color: var(--accent); }
+
+/* 扁平四宫格：3 列（尺宽 | 踏板连结/踏序 | 穿综/成布）× 4 行 */
 .board {
   display: grid;
   grid-template-columns: var(--ruler) calc(var(--T, 4) * var(--cell)) calc(var(--E, 24) * var(--cell));
-  grid-auto-rows: var(--cell);
-  gap: 3px 8px;
+  grid-template-rows: var(--cell) calc(var(--S, 4) * var(--cell)) var(--cell) calc(var(--P, 24) * var(--cell));
+  column-gap: 6px;
+  row-gap: 4px;
   width: max-content;
-}
-.board-head {
-  display: grid;
-  grid-template-columns: calc(var(--ruler) + var(--T, 4) * var(--cell) + 8px) calc(var(--E, 24) * var(--cell));
-  gap: 0 8px;
-  margin-bottom: 4px;
-  font-weight: 600;
-  color: var(--accent);
 }
 
 /* 角格与说明 */
@@ -125,21 +132,27 @@ input[type="number"] { width: 64px; }
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 2px;
-  padding: 2px 4px;
+  gap: 1px;
+  padding: 0 4px;
 }
 .corner-title { font-weight: 700; font-size: 12px; color: var(--accent); }
-.corner-shed { font-size: 11px; color: var(--muted); }
+.corner-shed { font-size: 10px; color: var(--muted); }
+.ruler-corner-blank { grid-column: 1; grid-row: 3; }
+.ruler-corner-br {
+  grid-column: 3; grid-row: 3;
+  display: flex; align-items: center; justify-content: flex-end;
+  padding-right: 4px; color: var(--muted);
+}
 
-/* 顶部数字尺 */
-.ruler-top {
-  grid-row: 1;
+/* 顶部/底部数字尺 */
+.ruler-top, .ruler-bottom {
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: var(--cell);
   grid-template-rows: var(--cell);
 }
-.ruler-top.ends { grid-column: 3; }
+.ruler-top.ends { grid-column: 3; grid-row: 1; }
+.ruler-bottom { grid-column: 2; grid-row: 3; }
 /* 左侧尺 */
 .ruler-left {
   display: grid;
@@ -147,12 +160,8 @@ input[type="number"] { width: 64px; }
   grid-auto-rows: var(--cell);
   grid-template-columns: var(--ruler);
 }
-.ruler-bottom, .ruler-treadles {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: var(--cell);
-  grid-template-rows: var(--cell);
-}
+.shaft-ruler { grid-column: 1; grid-row: 2; }
+.picks-ruler { grid-column: 1; grid-row: 4; }
 .rnum {
   display: flex;
   align-items: center;
@@ -160,13 +169,9 @@ input[type="number"] { width: 64px; }
   font-size: 9px;
   color: var(--muted);
   user-select: none;
+  position: relative;
 }
 .rnum.major { color: var(--ink); font-weight: 700; }
-.rnum.edge::after {
-  content: "";
-  position: absolute;
-}
-.ruler-top .rnum, .ruler-bottom .rnum { border-top: 1px solid transparent; }
 .rnum.bad {
   background: var(--red-soft);
   color: var(--red);
@@ -180,6 +185,7 @@ input[type="number"] { width: 64px; }
   border-radius: 3px;
   font-weight: 700;
 }
+.rnum.loc-flash { outline: 2px solid var(--blue); outline-offset: -2px; z-index: 4; }
 @keyframes pulse-bad {
   0%, 100% { box-shadow: 0 0 0 0 rgba(192,57,43,.35); }
   50% { box-shadow: 0 0 0 3px rgba(192,57,43,.12); }

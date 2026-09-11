@@ -34,6 +34,8 @@ CONTENT_TYPES = {
 def db_connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # 外键约束是连接级设置，必须显式打开，ON DELETE CASCADE 才会生效
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -60,6 +62,11 @@ def init_db():
                 created    REAL NOT NULL
             )
             """
+        )
+        # 清理在启用外键约束之前可能残留的孤儿版本
+        conn.execute(
+            """DELETE FROM versions
+               WHERE project_id NOT IN (SELECT id FROM projects)"""
         )
 
 
@@ -113,11 +120,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._get_version(int(parts[3]))
             if len(parts) == 3 and parts[:2] == ["api", "projects"]:
                 return self._get_project(int(parts[2]))
-            return self._serve_static(path)
         except ApiError as exc:
             return self._error(exc)
         except ValueError:
             return self._error(ApiError(400, "无效的编号"))
+        return self._serve_static(path)
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -138,28 +145,55 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             parts = [p for p in path.split("/") if p]
-            # /api/projects/<pid>            删项目（连同版本）
-            # /api/projects/<pid>/versions/<vid>  删版本
+            # /api/projects/<pid>                    删项目（外键级联清理其全部版本）
+            # /api/projects/<pid>/versions/<vid>     仅删该项目名下的指定版本
             if len(parts) == 3 and parts[:2] == ["api", "projects"]:
+                pid = int(parts[2])
                 with db_connect() as conn:
-                    conn.execute("DELETE FROM projects WHERE id=?", (int(parts[2]),))
-                return self._send_json({"ok": True})
+                    exists = conn.execute(
+                        "SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone()
+                    if exists is None:
+                        raise ApiError(404, f"项目 #{pid} 不存在")
+                    conn.execute("DELETE FROM versions WHERE project_id=?", (pid,))
+                    conn.execute("DELETE FROM projects WHERE id=?", (pid,))
+                return self._send_json({"ok": True, "deleted": "project", "id": pid})
             if (len(parts) == 5 and parts[:2] == ["api", "projects"]
                     and parts[3] == "versions"):
+                pid, vid = int(parts[2]), int(parts[4])
                 with db_connect() as conn:
-                    conn.execute("DELETE FROM versions WHERE id=?", (int(parts[4]),))
-                return self._send_json({"ok": True})
-            raise ApiError(404, "未知接口")
+                    proj = conn.execute(
+                        "SELECT 1 FROM projects WHERE id=?", (pid,)).fetchone()
+                    if proj is None:
+                        raise ApiError(404, f"项目 #{pid} 不存在")
+                    # 版本必须确实隶属于该项目，不能借项目路径删别人的版本
+                    ver = conn.execute(
+                        "SELECT 1 FROM versions WHERE id=? AND project_id=?",
+                        (vid, pid)).fetchone()
+                    if ver is None:
+                        raise ApiError(404, f"项目 #{pid} 下没有版本 #{vid}")
+                    conn.execute("DELETE FROM versions WHERE id=? AND project_id=?",
+                                 (vid, pid))
+                return self._send_json({"ok": True, "deleted": "version", "id": vid})
+            raise ApiError(404, f"未知地址：{path}")
+        except ApiError as exc:
+            return self._error(exc)
         except ValueError:
-            return self._error(ApiError(400, "无效的编号"))
+            return self._error(ApiError(400, "编号必须是整数"))
 
     # ---------- 静态文件 ----------
     def _serve_static(self, path):
         if path == "/":
             path = "/index.html"
         rel = os.path.normpath(os.path.join(STATIC_DIR, path.lstrip("/")))
-        if not rel.startswith(STATIC_DIR) or not os.path.isfile(rel):
-            self.send_error(404, "文件不存在")
+        inside = rel == STATIC_DIR or rel.startswith(STATIC_DIR + os.sep)
+        if not inside or not os.path.isfile(rel):
+            # 注意：状态行原因短语必须是 latin-1，不能含中文，否则 send_error 会崩
+            body = "404 文件不存在".encode("utf-8")
+            self.send_response(404, "Not Found")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         ext = os.path.splitext(rel)[1].lower()
         body = open(rel, "rb").read()
