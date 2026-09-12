@@ -12,21 +12,26 @@
 const state = {
   S: 4, T: 4, E: 24, P: 24,
   shed: "rising",
+  mode: "treadle",       // treadle=踏板组织图（tieup+treadling） | lift=直提升综计划（liftplan）
   threading: new Set(),
   tieup: new Set(),
   treadling: new Set(),
+  liftplan: new Set(),   // 直提模式：Set "p:s" 第 p 纬综框 s 升起（p=0 为最先织、位于最下方）
   warpColors: [],        // 每根经纱颜色（十六进制）
   weftColors: [],        // 每根纬纱颜色
   colorPrint: false,
   rules: { maxFront: 4, maxBack: 4, edge: true, edgeW: 1 },
   cell: 20,
 };
+/* 漏织纬在升综计划里的内部哨兵：键 "p:-1"（WIF 无此概念，导入/导出不写出） */
+const LIFT_DEAD = -1;
 const GRIDS = {
   threading: { set: () => state.threading, rows: () => state.S, cols: () => state.E },
   tieup:     { set: () => state.tieup,     rows: () => state.S, cols: () => state.T },
   treadling: { set: () => state.treadling, rows: () => state.P, cols: () => state.T },
+  liftplan:  { set: () => state.liftplan,  rows: () => state.P, cols: () => state.S },
 };
-const GRID_NAMES = { threading: "穿综", tieup: "踏板连结", treadling: "踏序" };
+const GRID_NAMES = { threading: "穿综", tieup: "踏板连结", treadling: "踏序", liftplan: "升综计划" };
 const DEFAULT_WARP = "#c0392b", DEFAULT_WEFT = "#2c3e50";
 const PALETTE = ["#2b2b28", "#c0392b", "#e67e22", "#f1c40f", "#27ae60",
                  "#2980b9", "#8e44ad", "#ecf0f1", "#8a5a2b", "#7f8c8d"];
@@ -36,8 +41,10 @@ let cloth = null;           // Int8Array(E*P)：1 经浮 / 0 纬浮 / -1 无交�
 let activeTreadles = null;  // Int8Array(P)：该纬是否踩到有效踏板
 let issues = [];            // 分析结果
 let issueCells = { threading: new Set(), tieup: new Set(), treadling: new Set(),
+                   liftplan: new Set(),
                    drawdown: new Set(), endRuler: new Set(), pickRuler: new Set(),
-                   shaftRuler: new Set(), treadleRuler: new Set() };
+                   shaftRuler: new Set(), treadleRuler: new Set(), liftColRuler: new Set(),
+                   pickWarnRuler: new Set() };
 
 /* 撤销/重做 */
 const history = { stack: [], index: -1, cap: 80 };
@@ -98,8 +105,9 @@ async function api(method, url, body) {
    ============================================================ */
 function snapshot() {
   return JSON.stringify({
-    S: state.S, T: state.T, E: state.E, P: state.P, shed: state.shed,
+    S: state.S, T: state.T, E: state.E, P: state.P, shed: state.shed, mode: state.mode,
     threading: [...state.threading], tieup: [...state.tieup], treadling: [...state.treadling],
+    liftplan: [...state.liftplan],
     warpColors: state.warpColors, weftColors: state.weftColors,
     name: $("#projectName").value,
   });
@@ -117,14 +125,17 @@ function pushHistory() {
 function restore(snap) {
   const d = JSON.parse(snap);
   state.S = d.S; state.T = d.T; state.E = d.E; state.P = d.P; state.shed = d.shed;
+  state.mode = d.mode || "treadle";
   state.threading = new Set(d.threading);
   state.tieup = new Set(d.tieup);
   state.treadling = new Set(d.treadling);
+  state.liftplan = new Set(d.liftplan || []);
   state.warpColors = d.warpColors || [];
   state.weftColors = d.weftColors || [];
   $("#projectName").value = d.name || "未命名项目";
   cancelSelection(true);
   syncSetupInputs();
+  applyModeUI();
   rebuildAll();
 }
 function undo() {
@@ -166,21 +177,22 @@ function buildGrid(kind) {
   }
   el.innerHTML = "";
   el.appendChild(frag);
-  attachGridEvents(el, kind);
+  if (!el.dataset.eventsBound) { attachGridEvents(el, kind); el.dataset.eventsBound = "1"; }
 }
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function dimsOf(kind) {
   if (kind === "threading") return { rows: state.S, cols: state.E };
   if (kind === "tieup") return { rows: state.S, cols: state.T };
+  if (kind === "liftplan") return { rows: state.P, cols: state.S };
   return { rows: state.P, cols: state.T }; // treadling
 }
 
-/* 数据行号 -> DOM 行号（踏序/成布：p=0 在最下） */
+/* 数据行号 -> DOM 行号（踏序/升综计划/成布：p=0 在最下） */
 function domRow(kind, dataRow) {
-  return kind === "treadling" ? dimsOf(kind).rows - 1 - dataRow : dataRow;
+  return (kind === "treadling" || kind === "liftplan") ? dimsOf(kind).rows - 1 - dataRow : dataRow;
 }
 function dataRow(kind, domR) {
-  return kind === "treadling" ? dimsOf(kind).rows - 1 - domR : domR;
+  return (kind === "treadling" || kind === "liftplan") ? dimsOf(kind).rows - 1 - domR : domR;
 }
 
 function renderGrid(kind) {
@@ -206,9 +218,11 @@ function rebuildAll() {
   buildGrid("tieup");
   buildGrid("threading");
   buildGrid("treadling");
+  buildGrid("liftplan");
   renderGrid("tieup");
   renderGrid("threading");
   renderGrid("treadling");
+  renderGrid("liftplan");
   renderColorChips();
   runAnalysis();
   renderDrawdown();
@@ -219,6 +233,7 @@ function setBoardVars() {
   const b = $("#board");
   b.style.setProperty("--S", state.S);
   b.style.setProperty("--T", state.T);
+  b.style.setProperty("--M", state.mode === "lift" ? state.S : state.T);
   b.style.setProperty("--E", state.E);
   b.style.setProperty("--P", state.P);
   b.style.setProperty("--cell", state.cell + "px");
@@ -235,13 +250,16 @@ function buildRulers() {
   const treadles = $("#treadleRuler");
   const shafts = $("#shaftRuler");
   const picks = $("#picksRuler");
+  const liftCols = $("#liftColRuler");
   ends.innerHTML = rangeHtml(state.E, (i) => rulerNum(i + 1, "end", i));
   treadles.innerHTML = rangeHtml(state.T, (i) => rulerNum(i + 1, "treadle", i));
   shafts.innerHTML = rangeHtml(state.S, (i) => rulerNum(i + 1, "shaft", i));
+  // 升综计划列尺：列=综框号
+  liftCols.innerHTML = rangeHtml(state.S, (i) => rulerNum(i + 1, "liftcol", i));
   // 纬纱尺：p=0（最先织）在最下
   picks.innerHTML = rangeHtml(state.P, (domR) =>
     rulerNum(state.P - domR, "pick", state.P - 1 - domR));
-  [ends, treadles, shafts, picks].forEach((r) => {
+  [ends, treadles, shafts, picks, liftCols].forEach((r) => {
     r.querySelectorAll(".rnum").forEach((n) => {
       n.addEventListener("click", onRulerClick);
     });
@@ -349,6 +367,9 @@ function applyCell(kind, dR, dc, val) {
     if (val) {
       for (let s = 0; s < 1024; s++) if (set.has(key(s, dc))) set.delete(key(s, dc));
     }
+  } else if (kind === "liftplan") {
+    // 升综计划：涂任一综即清掉该纬“漏织”哨兵；哨兵本身不参与普通格点
+    if (val) set.delete(key(dR, LIFT_DEAD));
   }
   if (val) set.add(k); else set.delete(k);
   const { rows, cols } = dimsOf(kind);
@@ -380,6 +401,7 @@ function updateCoordBar(ev, kind, pos) {
   let txt = "";
   if (kind === "threading") txt = `穿综：经纱 ${pos.dc + 1} → 综框 ${pos.dR + 1}`;
   else if (kind === "tieup") txt = `连结：综框 ${pos.dR + 1} × 踏板 ${pos.dc + 1}`;
+  else if (kind === "liftplan") txt = `升综计划：第 ${pos.dR + 1} 纬（自织口）× 综框 ${pos.dc + 1}`;
   else txt = `踏序：第 ${pos.dR + 1} 纬（自织口）× 踏板 ${pos.dc + 1}`;
   $("#coordText").textContent = txt;
   maybeShowIssueTip(ev, kind, pos.dR, pos.dc);
@@ -484,6 +506,7 @@ function doPaste(gridKind, dR, dc) {
   const { rows, cols } = dimsOf(gridKind);
   if (clip.bits[0].length > cols) { toast("剪贴板比目标网格宽，无法粘贴"); return; }
   const target = GRIDS[gridKind].set();
+  const deadRows = new Set();
   for (let r = 0; r < clip.rows; r++) {
     const tr = dR + r;
     if (tr >= rows) break;
@@ -491,9 +514,11 @@ function doPaste(gridKind, dR, dc) {
       const tc = dc + c;
       if (tc >= cols) break;
       const k = key(tr, tc);
-      if (clip.bits[r][c]) target.add(k); else target.delete(k);
+      if (clip.bits[r][c]) { target.add(k); if (gridKind === "liftplan") deadRows.add(tr); }
+      else target.delete(k);
     }
   }
+  if (gridKind === "liftplan") deadRows.forEach((p) => target.delete(key(p, LIFT_DEAD)));
   cancelSelection(true);
   pushHistory();
   afterEdit();
@@ -521,55 +546,97 @@ function selRepeat() {
 
 /* ============================================================
    成布计算
-   规则：
+   规则（踏板模式）：
      提综逻辑：被提起的综（tieup 连结 + 本纬踩下）使经纱在上 → 1
      沉综逻辑：标记的综下沉，未沉的综在上 → 取反
      经纱未穿综 / 本纬无有效踏板 → -1 无交织
+   规则（直提模式）：
+     LIFTPLAN 按 WIF 约定给出本纬“升起”的综；sinking 开口时由沉下综成纬浮，
+     故升综判定为 shed==="rising" ? 在计划中 : 不在计划中。
+     哨兵 "p:-1"（由踏板转换而来的漏织纬）→ 整纬 -1。
    ============================================================ */
 function computeCloth() {
-  const { S, T, E, P } = state;
-  cloth = new Int8Array(E * P);
-  activeTreadles = new Int8Array(P);
+  const r = computeClothFrom(state);
+  cloth = r.cloth;
+  activeTreadles = r.active;
+}
+
+/* 按给定草稿（state 或变体对象）重算成布；返回 {cloth, active} */
+function computeClothFrom(d) {
+  const S = d.S ?? state.S, T = d.T ?? state.T, E = d.E ?? state.E, P = d.P ?? state.P;
+  const shed = d.shed ?? state.shed;
+  const mode = d.mode ?? state.mode;
+  const out = new Int8Array(E * P);
+  const active = new Int8Array(P);
 
   // 每根经纱所在综（-1 未穿）
   const shaftOfEnd = new Int16Array(E).fill(-1);
-  for (const k of state.threading) {
+  for (const k of d.threading) {
     const [s, e] = parseKey(k);
     if (e < E && s < S) shaftOfEnd[e] = s;
   }
-  // 每片综连结了哪些踏板
-  const treadlesOfShaft = Array.from({ length: S }, () => []);
-  for (const k of state.tieup) {
-    const [s, t] = parseKey(k);
-    if (s < S && t < T) treadlesOfShaft[s].push(t);
-  }
-  // 每一纬踩下的踏板
-  const treadlesOfPick = Array.from({ length: P }, () => []);
-  for (const k of state.treadling) {
-    const [p, t] = parseKey(k);
-    if (p < P && t < T) treadlesOfPick[p].push(t);
+
+  // 每纬升起的综（直提模式直接给出；踏板模式由连结∪踩下合成）
+  const upByPick = Array.from({ length: P }, () => new Uint8Array(S));
+  if (mode === "lift") {
+    // LIFTPLAN 按 WIF 约定始终列出“升起”的综框，与 Shed 无关：
+    // 提综开口直接据此判断；沉综开口下列出者同样升起、未列者沉下。
+    const lift = d.liftplan || state.liftplan;
+    const dead = new Uint8Array(P);
+    const hasMark = new Uint8Array(P);
+    for (const k of lift) {
+      const [p, s] = parseKey(k);
+      if (p >= P) continue;
+      if (s === LIFT_DEAD) dead[p] = 1;
+      else if (s < S) { upByPick[p][s] = 1; hasMark[p] = 1; }
+    }
+    for (let p = 0; p < P; p++) {
+      if (dead[p] || !hasMark[p]) continue; // 漏织哨兵 / 空行：active 保持 0，稍后记 -1
+      active[p] = 1;
+    }
+  } else {
+    // 每片综连结了哪些踏板
+    const treadlesOfShaft = Array.from({ length: S }, () => []);
+    for (const k of d.tieup) {
+      const [s, t] = parseKey(k);
+      if (s < S && t < T) treadlesOfShaft[s].push(t);
+    }
+    for (let p = 0; p < P; p++) {
+      const pressed = new Set();
+      for (const k of d.treadling) {
+        const [pp, t] = parseKey(k);
+        if (pp === p && t < T) pressed.add(t);
+      }
+      if (pressed.size === 0) continue; // 整纬无踏板 → -1
+      active[p] = 1;
+      for (let s = 0; s < S; s++) {
+        let linked = treadlesOfShaft[s].some((t) => pressed.has(t));
+        if (shed === "sinking") linked = !linked;
+        upByPick[p][s] = linked ? 1 : 0;
+      }
+    }
   }
 
   for (let p = 0; p < P; p++) {
-    const pressed = new Set(treadlesOfPick[p]);
-    if (pressed.size === 0) {
-      cloth.fill(-1, p * E, (p + 1) * E);
-      continue;
-    }
-    activeTreadles[p] = 1;
-    // 每片综本纬是否升起
-    const shaftUp = new Uint8Array(S);
-    for (let s = 0; s < S; s++) {
-      let linked = treadlesOfShaft[s].some((t) => pressed.has(t));
-      if (state.shed === "sinking") linked = !linked;
-      shaftUp[s] = linked ? 1 : 0;
-    }
+    if (!active[p]) { out.fill(-1, p * E, (p + 1) * E); continue; }
     for (let e = 0; e < E; e++) {
       const s = shaftOfEnd[e];
-      cloth[p * E + e] = s < 0 ? -1 : shaftUp[s] ? 1 : 0;
+      out[p * E + e] = s < 0 ? -1 : upByPick[p][s] ? 1 : 0;
     }
   }
+  return { cloth: out, active };
 }
+
+/* 每纬升综签名（数组）：空数组代表漏织纬。供转换/打印周期/播放复用 */
+function liftSetOfPick(p) {
+  const arr = [];
+  for (const k of state.liftplan) {
+    const [pp, s] = parseKey(k);
+    if (pp === p && s >= 0 && s < state.S) arr.push(s);
+  }
+  return arr.sort((a, b) => a - b);
+}
+function isDeadLiftPick(p) { return state.liftplan.has(key(p, LIFT_DEAD)); }
 
 /* ============================================================
    成布 SVG 渲染
@@ -658,9 +725,12 @@ function runAnalysis() {
   const R = state.rules;
   issues = [];
   issueCells = { threading: new Set(), tieup: new Set(), treadling: new Set(),
+                 liftplan: new Set(),
                  drawdown: new Set(), endRuler: new Set(), pickRuler: new Set(),
-                 shaftRuler: new Set(), treadleRuler: new Set() };
+                 shaftRuler: new Set(), treadleRuler: new Set(), liftColRuler: new Set(),
+                 pickWarnRuler: new Set() };
 
+  const isLift = state.mode === "lift";
   const shaftUsed = new Uint8Array(S), treadleUsed = new Uint8Array(T);
   const endThreaded = new Uint8Array(E);
   const endShaft = new Int16Array(E).fill(-1);
@@ -679,9 +749,16 @@ function runAnalysis() {
     const [p, t] = parseKey(k);
     if (p < P && t < T) treadleUsed[t] = 1;
   }
+  const liftUsed = new Uint8Array(S);
+  if (isLift) {
+    for (const k of state.liftplan) {
+      const [p, s] = parseKey(k);
+      if (p < P && s >= 0 && s < S) liftUsed[s] = 1;
+    }
+  }
 
   /* ---- 越界引用（数据里有、当前尺寸外的标记） ---- */
-  const over = { threading: [], tieup: [], treadling: [] };
+  const over = { threading: [], tieup: [], treadling: [], liftplan: [] };
   for (const k of state.threading) {
     const [s, e] = parseKey(k);
     if (s >= S || e >= E) over.threading.push([s, e]);
@@ -694,6 +771,12 @@ function runAnalysis() {
     const [p, t] = parseKey(k);
     if (p >= P || t >= T) over.treadling.push([p, t]);
   }
+  if (isLift) {
+    for (const k of state.liftplan) {
+      const [p, s] = parseKey(k);
+      if (s !== LIFT_DEAD && (p >= P || s >= S)) over.liftplan.push([p, s]);
+    }
+  }
   if (over.threading.length) issues.push({
     sev: "error", kind: "oor-threading",
     title: `穿综越界引用 ×${over.threading.length}`,
@@ -702,19 +785,26 @@ function runAnalysis() {
     locs: over.threading.slice(0, 8).map(([s, e]) => ({
       kind: "text", text: `经${e + 1}→综${s + 1}` })),
   });
-  if (over.tieup.length) issues.push({
+  if (!isLift && over.tieup.length) issues.push({
     sev: "error", kind: "oor-tieup",
     title: `连结越界 ×${over.tieup.length}`,
     desc: "踏板连结中存在超出当前综框/踏板数的标记。",
     fix: { label: "清除越界标记", action: "trim", grid: "tieup" },
     locs: over.tieup.slice(0, 8).map(([s, t]) => ({ kind: "text", text: `综${s + 1}×踏${t + 1}` })),
   });
-  if (over.treadling.length) issues.push({
+  if (!isLift && over.treadling.length) issues.push({
     sev: "error", kind: "oor-treadling",
     title: `踏序越界 ×${over.treadling.length}`,
     desc: "踏序中存在超出当前纬纱/踏板数的标记。",
     fix: { label: "清除越界标记", action: "trim", grid: "treadling" },
     locs: over.treadling.slice(0, 8).map(([p, t]) => ({ kind: "text", text: `纬${p + 1}×踏${t + 1}` })),
+  });
+  if (isLift && over.liftplan.length) issues.push({
+    sev: "error", kind: "oor-liftplan",
+    title: `升综计划越界 ×${over.liftplan.length}`,
+    desc: "升综计划中存在超出当前纬纱/综框数的标记。",
+    fix: { label: "清除越界标记", action: "trim", grid: "liftplan" },
+    locs: over.liftplan.slice(0, 8).map(([p, s]) => ({ kind: "text", text: `纬${p + 1}×综${s + 1}` })),
   });
 
   /* ---- 未穿综的经纱 ---- */
@@ -732,23 +822,36 @@ function runAnalysis() {
       kind: "threading-end", end: e, text: `经纱 ${e + 1}` })),
   });
 
-  /* ---- 漏织（整纬无踏板） ---- */
+  /* ---- 漏织（整纬无开口） ---- */
   const deadPicks = [];
-  for (let p = 0; p < P; p++) {
-    let any = false;
-    for (let t = 0; t < T; t++) if (state.treadling.has(key(p, t))) { any = true; break; }
-    if (!any) deadPicks.push(p);
-  }
-  for (const p of deadPicks) {
-    issueCells.pickRuler.add(p);
-    for (let e = 0; e < E; e++) issueCells.drawdown.add(key(p, e));
+  if (isLift) {
+    for (let p = 0; p < P; p++) {
+      if (!activeTreadles[p]) {
+        deadPicks.push(p);
+        issueCells.pickRuler.add(p);
+        for (let s = 0; s < S; s++) issueCells.liftplan.add(key(p, s));
+        for (let e = 0; e < E; e++) issueCells.drawdown.add(key(p, e));
+      }
+    }
+  } else {
+    for (let p = 0; p < P; p++) {
+      let any = false;
+      for (let t = 0; t < T; t++) if (state.treadling.has(key(p, t))) { any = true; break; }
+      if (!any) deadPicks.push(p);
+    }
+    for (const p of deadPicks) {
+      issueCells.pickRuler.add(p);
+      for (let e = 0; e < E; e++) issueCells.drawdown.add(key(p, e));
+    }
   }
   if (deadPicks.length) issues.push({
     sev: "error", kind: "dead-pick",
-    title: `漏织纬纱 ×${deadPicks.length}`,
-    desc: "这些纬没有踩任何踏板（或所踩踏板无连结），梭口不开。",
+    title: `${isLift ? "升综计划漏织纬纱" : "漏织纬纱"} ×${deadPicks.length}`,
+    desc: isLift
+      ? "这些纬没有任何升起的综框（整行空白），梭口不开。"
+      : "这些纬没有踩任何踏板（或所踩踏板无连结），梭口不开。",
     locs: deadPicks.slice(0, 10).map((p) => ({
-      kind: "treadling-pick", pick: p, text: `第 ${p + 1} 纬` })),
+      kind: "dead-pick-loc", pick: p, text: `第 ${p + 1} 纬` })),
   });
 
   /* ---- 浮长：逐经（经浮，正面）/ 逐纬（纬浮，反面） ---- */
@@ -825,7 +928,7 @@ function runAnalysis() {
     if (nL + nR > 0) issues.push({
       sev: "error", kind: "edge",
       title: `边经漏交织（左 ${nL} 点 / 右 ${nR} 点）`,
-      desc: `最外侧各 ${R.edgeW} 根边经要求逐纬与纬纱交换上下；请检查边部穿综与踏序。`,
+      desc: `最外侧各 ${R.edgeW} 根边经要求逐纬与纬纱交换上下；请检查边部穿综与${isLift ? "升综计划" : "踏序"}。`,
       locs: [
         ...[...badEdges.left].slice(0, 5).map((p) => ({
           kind: "drawdown", p, e: findEdgeEnd(E, R.edgeW, "left", p), text: `左边 第${p + 1}纬` })),
@@ -839,8 +942,16 @@ function runAnalysis() {
   const unusedShafts = [], deadShafts = [];
   for (let s = 0; s < S; s++) {
     if (!shaftUsed[s]) unusedShafts.push(s);
-    if (shaftUsed[s] && !shaftTied[s]) deadShafts.push(s);
+    if (shaftUsed[s]) {
+      const neverMoves = isLift ? !liftUsed[s] : !shaftTied[s];
+      if (neverMoves) deadShafts.push(s);
+    }
     if (!shaftUsed[s]) issueCells.shaftRuler.add(s);
+    if (isLift && shaftUsed[s] && !liftUsed[s]) {
+      issueCells.liftColRuler.add(s);
+      // 升综计划对应列也标出
+      for (let p = 0; p < P; p++) issueCells.liftplan.add(key(p, s));
+    }
   }
   if (unusedShafts.length) issues.push({
     sev: "warn", kind: "unused-shaft",
@@ -851,30 +962,35 @@ function runAnalysis() {
   if (deadShafts.length) issues.push({
     sev: "warn", kind: "dead-shaft",
     title: `死综 ×${deadShafts.length}`,
-    desc: "有经纱穿入但踏板连结里没有连接，踩任何踏板都不会动。",
-    locs: deadShafts.map((s) => ({ kind: "tieup-row", s, text: `综框 ${s + 1}` })),
+    desc: isLift
+      ? "有经纱穿入，但升综计划中这些综框从未升起（或在沉综逻辑下应改用计划外综框表达）。"
+      : "有经纱穿入但踏板连结里没有连接，踩任何踏板都不会动。",
+    locs: deadShafts.map((s) => ({
+      kind: isLift ? "liftcol" : "tieup-row", s, text: `综框 ${s + 1}` })),
   });
 
-  /* ---- 未使用踏板 / 空踏板 ---- */
-  const unusedTreadles = [], emptyTreadles = [];
-  for (let t = 0; t < T; t++) {
-    if (!treadleUsed[t]) unusedTreadles.push(t);
-    if (treadleUsed[t] && !treadleLinked[t]) emptyTreadles.push(t);
-    if (!treadleUsed[t] || (treadleUsed[t] && !treadleLinked[t]))
-      issueCells.treadleRuler.add(t);
+  /* ---- 未使用踏板 / 空踏板（仅踏板模式） ---- */
+  if (!isLift) {
+    const unusedTreadles = [], emptyTreadles = [];
+    for (let t = 0; t < T; t++) {
+      if (!treadleUsed[t]) unusedTreadles.push(t);
+      if (treadleUsed[t] && !treadleLinked[t]) emptyTreadles.push(t);
+      if (!treadleUsed[t] || (treadleUsed[t] && !treadleLinked[t]))
+        issueCells.treadleRuler.add(t);
+    }
+    if (unusedTreadles.length) issues.push({
+      sev: "warn", kind: "unused-treadle",
+      title: `未使用踏板 ×${unusedTreadles.length}`,
+      desc: "踏序中从未踩下这些踏板（踏板号已在尺上标出）。",
+      locs: unusedTreadles.map((t) => ({ kind: "treadle", t, text: `踏板 ${t + 1}` })),
+    });
+    if (emptyTreadles.length) issues.push({
+      sev: "error", kind: "empty-treadle",
+      title: `空连结踏板被使用 ×${emptyTreadles.length}`,
+      desc: "踏序踩了这些踏板，但它们没有连结任何综框，等于空踩。",
+      locs: emptyTreadles.map((t) => ({ kind: "treadling-treadle", t, text: `踏板 ${t + 1}` })),
+    });
   }
-  if (unusedTreadles.length) issues.push({
-    sev: "warn", kind: "unused-treadle",
-    title: `未使用踏板 ×${unusedTreadles.length}`,
-    desc: "踏序中从未踩下这些踏板（踏板号已在尺上标出）。",
-    locs: unusedTreadles.map((t) => ({ kind: "treadle", t, text: `踏板 ${t + 1}` })),
-  });
-  if (emptyTreadles.length) issues.push({
-    sev: "error", kind: "empty-treadle",
-    title: `空连结踏板被使用 ×${emptyTreadles.length}`,
-    desc: "踏序踩了这些踏板，但它们没有连结任何综框，等于空踩。",
-    locs: emptyTreadles.map((t) => ({ kind: "treadling-treadle", t, text: `踏板 ${t + 1}` })),
-  });
 
   /* ---- 重复穿综：同列多个标记（界面约束下一般不会出现，导入数据可能） ---- */
   const dupEnds = [];
@@ -890,6 +1006,7 @@ function runAnalysis() {
   renderGrid("threading");
   renderGrid("tieup");
   renderGrid("treadling");
+  renderGrid("liftplan");
   drawIssueOverlays();
   applyAllRulerMarks();
   updateIssueSummary();
@@ -984,15 +1101,30 @@ function locateIssue(it, li) {
     case "threading-end":
       flashGridCell("threading", endShaftOf(loc.end), loc.end);
       break;
-    case "treadling-pick": {
-      const t = firstTreadleOfPick(loc.pick);
-      if (t >= 0) flashGridCell("treadling", loc.pick, t);
-      else scrollRuler("picksRuler", "pick", loc.pick);
+    case "treadling-pick":
+    case "dead-pick-loc": {
+      if (state.mode === "lift") {
+        // 直提模式：定位升综计划对应行（从第 1 列开始可见）
+        const cols = state.S;
+        if (cols > 0) {
+          const idx = domRow("liftplan", loc.pick) * cols;
+          const el = $("#gridLiftplan").children[idx];
+          if (el) { el.classList.add("loc-flash"); scrollToView(el); setTimeout(() => el.classList.remove("loc-flash"), 1800); }
+        }
+      } else {
+        const t = firstTreadleOfPick(loc.pick);
+        if (t >= 0) flashGridCell("treadling", loc.pick, t);
+        else scrollRuler("picksRuler", "pick", loc.pick);
+      }
       break;
     }
     case "shaft":
       flashTieupRow(loc.s);
       scrollRuler("shaftRuler", "shaft", loc.s);
+      break;
+    case "liftcol":
+      flashLiftCol(loc.s);
+      scrollRuler("liftColRuler", "liftcol", loc.s);
       break;
     case "tieup-row":
       flashTieupRow(loc.s);
@@ -1050,6 +1182,14 @@ function flashTreadleCol(t) {
   scrollToView($("#gridTreadling"));
   setTimeout(() => $$(".loc-flash").forEach((n) => n.classList.remove("loc-flash")), 1800);
 }
+function flashLiftCol(s) {
+  const el = $("#gridLiftplan");
+  const cols = state.S;
+  for (let r = 0; r < state.P; r++)
+    el.children[r * cols + s].classList.add("loc-flash");
+  scrollToView(el);
+  setTimeout(() => el.querySelectorAll(".loc-flash").forEach((n) => n.classList.remove("loc-flash")), 1800);
+}
 function scrollRuler(rulerId, kind, idx) {
   const n = $(`#${rulerId} .rnum[data-idx="${idx}"]`);
   if (n) scrollToView(n, { block: "center", inline: "nearest", behavior: "smooth" });
@@ -1096,15 +1236,21 @@ function applyAllRulerMarks() {
     ["endsRuler", "end", issueCells.endRuler],
     ["shaftRuler", "shaft", issueCells.shaftRuler],
     ["treadleRuler", "treadle", issueCells.treadleRuler],
+    ["liftColRuler", "liftcol", issueCells.liftColRuler],
     ["picksRuler", "pick", issueCells.pickRuler],
   ];
-  $$(".rnum.bad,.rnum.unused").forEach((n) => n.classList.remove("bad", "unused"));
-  // end / pick 为错误红；shaft / treadle 未使用为琥珀
+  $$(".rnum.bad,.rnum.unused,.rnum.warn-mark").forEach((n) =>
+    n.classList.remove("bad", "unused", "warn-mark"));
+  // end / pick 为错误红；shaft / treadle / liftcol 未使用为琥珀
   for (const [rulerId, kind, set] of map) {
     for (const idx of set) {
       const n = $(`#${rulerId} .rnum[data-idx="${idx}"]`);
-      if (n) n.classList.add(kind === "shaft" || kind === "treadle" ? "unused" : "bad");
+      if (n) n.classList.add(kind === "shaft" || kind === "treadle" || kind === "liftcol" ? "unused" : "bad");
     }
+  }
+  for (const idx of issueCells.pickWarnRuler) {
+    const n = $(`#picksRuler .rnum[data-idx="${idx}"]`);
+    if (n && !issueCells.pickRuler.has(idx)) n.classList.add("warn-mark");
   }
 }
 
@@ -1125,6 +1271,10 @@ function maybeShowIssueTip(ev, kind, dR, dc) {
     if (issueCells.pickRuler.has(dR)) found = issues.filter((i) => i.kind === "dead-pick");
     if (issueCells.treadleRuler.has(dc))
       found = found.concat(issues.filter((i) => i.kind === "unused-treadle" || i.kind === "empty-treadle"));
+  } else if (kind === "liftplan") {
+    if (issueCells.pickRuler.has(dR)) found = issues.filter((i) => i.kind === "dead-pick");
+    if (issueCells.liftColRuler.has(dc))
+      found = found.concat(issues.filter((i) => i.kind === "dead-shaft"));
   }
   found = uniqBy(found, (x) => x.kind);
   if (found.length) {
@@ -1189,6 +1339,7 @@ function onRulerClick(ev) {
   let issue;
   if (kind === "end") issue = issues.find((i) => i.kind === "unthreaded" || i.kind === "edge");
   if (kind === "shaft") issue = issues.find((i) => i.kind === "dead-shaft" || i.kind === "unused-shaft");
+  if (kind === "liftcol") issue = issues.find((i) => i.kind === "dead-shaft");
   if (kind === "treadle") issue = issues.find((i) => i.kind === "empty-treadle" || i.kind === "unused-treadle");
   if (kind === "pick") issue = issues.find((i) => i.kind === "dead-pick");
   if (issue) {
@@ -1215,11 +1366,63 @@ function drawPlayOverlay() {
   html += `<line x1="0" y1="${y + 1}" x2="${E}" y2="${y + 1}" stroke="#2e7d4f" stroke-width=".18"/>`;
   g.innerHTML = html;
 }
+/* 当前纬各综是否升起（按当前模式与开口逻辑） */
+function upShaftsAtPick(p) {
+  const up = new Uint8Array(state.S);
+  if (state.mode === "lift") {
+    let has = false;
+    for (const k of state.liftplan) {
+      const [pp, s] = parseKey(k);
+      if (pp === p && s >= 0 && s < state.S) { up[s] = 1; has = true; }
+    }
+    if (!has || state.liftplan.has(key(p, LIFT_DEAD))) return null;
+  } else {
+    const pressed = new Set();
+    for (const k of state.treadling) {
+      const [pp, t] = parseKey(k);
+      if (pp === p && t < state.T) pressed.add(t);
+    }
+    if (!pressed.size) return null;
+    for (let s = 0; s < state.S; s++) {
+      let linked = false;
+      for (const k of state.tieup) {
+        const [ss, t] = parseKey(k);
+        if (ss === s && pressed.has(t)) { linked = true; break; }
+      }
+      if (state.shed === "sinking") linked = !linked;
+      up[s] = linked ? 1 : 0;
+    }
+  }
+  return up;
+}
 function applyPlayHighlights() {
   $$(".cell.play-shaft,.cell.play-treadle").forEach((n) =>
     n.classList.remove("play-shaft", "play-treadle"));
   if (play.pick < 0) return;
   const p = play.pick;
+
+  if (state.mode === "lift") {
+    const up = upShaftsAtPick(p);
+    // 高亮升综计划行
+    const lp = $("#gridLiftplan");
+    const dr = domRow("liftplan", p);
+    for (const k of state.liftplan) {
+      const [pp, s] = parseKey(k);
+      if (pp === p && s >= 0 && s < state.S)
+        lp.children[dr * state.S + s].classList.add("play-shaft");
+    }
+    $$("#shaftRuler .rnum, #liftColRuler .rnum").forEach((rn) => {
+      const s = +rn.dataset.idx;
+      const isUp = up && up[s];
+      rn.style.background = isUp ? "rgba(127,199,155,.85)" : "";
+      rn.style.fontWeight = isUp ? "700" : "";
+    });
+    $$("#picksRuler .rnum").forEach((rn) => {
+      rn.style.background = +rn.dataset.idx === p ? "rgba(46,125,79,.35)" : "";
+    });
+    return;
+  }
+
   const pressed = new Set();
   for (let t = 0; t < state.T; t++)
     if (state.treadling.has(key(p, t))) pressed.add(t);
@@ -1234,9 +1437,6 @@ function applyPlayHighlights() {
     const [s, t] = parseKey(k);
     if (pressed.has(t)) {
       $("#gridTieup").children[s * state.T + t].classList.add("play-shaft");
-      // 综框尺高亮
-      const rn = $(`#shaftRuler .rnum[data-idx="${s}"]`);
-      if (rn) rn.style.background = "rgba(217,167,103,.6)";
     }
   }
   $$("#shaftRuler .rnum").forEach((rn) => {
@@ -1244,7 +1444,7 @@ function applyPlayHighlights() {
     let up = false;
     for (const k of state.tieup) {
       const [ss, t] = parseKey(k);
-      if (ss === s && pressed.has(t)) up = true;
+      if (ss === s && pressed.has(t)) { up = true; break; }
     }
     rn.style.background = up ? "rgba(217,167,103,.75)" : "";
     rn.style.fontWeight = up ? "700" : "";
@@ -1265,7 +1465,8 @@ function setPlayPick(p) {
   $("#playInfo").textContent =
     play.pick < 0 ? `第 — / ${state.P} 纬（待开始）` :
     `织造第 ${play.pick + 1} / ${state.P} 纬（织口在第 ${play.pick + 1} 行）`;
-  renderGrid("threading"); renderGrid("tieup"); renderGrid("treadling");
+  renderGrid("threading"); renderGrid("tieup");
+  renderGrid("treadling"); renderGrid("liftplan");
   clearPlayRulerStyles();
   applyPlayHighlights();
   drawPlayOverlay();
@@ -1301,10 +1502,13 @@ function stepPlay(d) {
    ============================================================ */
 function buildVariant(kind) {
   const v = {
+    S: state.S, T: state.T, E: state.E, P: state.P,
     threading: new Set(state.threading),
     tieup: new Set(state.tieup),
     treadling: new Set(state.treadling),
+    liftplan: new Set(state.liftplan),
     shed: state.shed,
+    mode: state.mode,
   };
   if (kind === "mirror") {
     // 左右镜像：经纱顺序反转（穿综列镜像）
@@ -1315,18 +1519,47 @@ function buildVariant(kind) {
     }
   } else if (kind === "reverse") {
     // 上下反转：纬纱织造顺序倒序
-    v.treadling = new Set();
-    for (const k of state.treadling) {
-      const [p, t] = parseKey(k);
-      v.treadling.add(key(state.P - 1 - p, t));
+    if (state.mode === "lift") {
+      v.liftplan = new Set();
+      for (const k of state.liftplan) {
+        const [p, s] = parseKey(k);
+        v.liftplan.add(key(state.P - 1 - p, s));
+      }
+    } else {
+      v.treadling = new Set();
+      for (const k of state.treadling) {
+        const [p, t] = parseKey(k);
+        v.treadling.add(key(state.P - 1 - p, t));
+      }
     }
   } else if (kind === "flip") {
-    // 换面：交换提综/沉综逻辑；为保持成布等价，同时反转 tieup 连结
+    // 换面：交换提综/沉综逻辑；为保持成布等价，反转“升综表达”
     v.shed = state.shed === "rising" ? "sinking" : "rising";
-    v.tieup = new Set();
-    for (let s = 0; s < state.S; s++)
-      for (let t = 0; t < state.T; t++)
-        if (!state.tieup.has(key(s, t))) v.tieup.add(key(s, t));
+    if (state.mode === "lift") {
+      // 直提：把每纬升综综框换成其补集（漏织纬保持漏织）
+      const lift = new Set();
+      const dead = new Uint8Array(state.P);
+      for (const k of state.liftplan) {
+        const [p, s] = parseKey(k);
+        if (s === LIFT_DEAD && p < state.P) dead[p] = 1;
+      }
+      const present = Array.from({ length: state.P }, () => new Uint8Array(state.S));
+      let any = new Uint8Array(state.P);
+      for (const k of state.liftplan) {
+        const [p, s] = parseKey(k);
+        if (s >= 0 && s < state.S && p < state.P) { present[p][s] = 1; any[p] = 1; }
+      }
+      for (let p = 0; p < state.P; p++) {
+        if (!any[p] || dead[p]) { lift.add(key(p, LIFT_DEAD)); continue; }
+        for (let s = 0; s < state.S; s++) if (!present[p][s]) lift.add(key(p, s));
+      }
+      v.liftplan = lift;
+    } else {
+      v.tieup = new Set();
+      for (let s = 0; s < state.S; s++)
+        for (let t = 0; t < state.T; t++)
+          if (!state.tieup.has(key(s, t))) v.tieup.add(key(s, t));
+    }
   }
   return v;
 }
@@ -1350,6 +1583,8 @@ function applyVariant() {
   state.threading = d.threading;
   state.tieup = d.tieup;
   state.treadling = d.treadling;
+  state.liftplan = d.liftplan || new Set();
+  state.mode = d.mode || "treadle";
   state.shed = d.shed;
   $("#shed").value = d.shed;
   updateShedHint();
@@ -1358,6 +1593,8 @@ function applyVariant() {
   $("#variantPreview").innerHTML =
     '<p class="muted">已采用变体。可继续选择新的变体，或用撤销回到原版本。</p>';
   cancelSelection(true);
+  syncSetupInputs();
+  applyModeUI();
   rebuildAll();
   pushHistory();
   toast("已替换为变体");
@@ -1371,26 +1608,7 @@ function cancelVariant() {
 
 /* 变体预览小 SVG：直接按 draft 数据重算成布 */
 function computeClothOf(d) {
-  const { S, T, E, P } = state;
-  const arr = new Int8Array(E * P);
-  const shaftOfEnd = new Int16Array(E).fill(-1);
-  for (const k of d.threading) { const [s, e] = parseKey(k); if (e < E && s < S) shaftOfEnd[e] = s; }
-  const upShaft = Array.from({ length: P }, () => new Uint8Array(S));
-  for (let p = 0; p < P; p++) {
-    const pressed = new Set();
-    for (let t = 0; t < T; t++) if (d.treadling.has(key(p, t))) pressed.add(t);
-    for (let s = 0; s < S; s++) {
-      let linked = false;
-      for (let t = 0; t < T; t++) if (pressed.has(t) && d.tieup.has(key(s, t))) linked = true;
-      if (d.shed === "sinking") linked = !linked;
-      upShaft[p][s] = linked ? 1 : 0;
-    }
-    for (let e = 0; e < E; e++) {
-      const s = shaftOfEnd[e];
-      arr[p * E + e] = s < 0 ? -1 : (upShaft[p][s] ? 1 : 0);
-    }
-  }
-  return arr;
+  return computeClothFrom(d).cloth;
 }
 function renderDraftClothSvg(st, diff) {
   const arr = computeClothOf(st);
@@ -1425,10 +1643,260 @@ function clothSvgEl(arr, E, P, px, diffA, diffB) {
 }
 
 /* ============================================================
+   编辑区模式：踏板组织图 ⇄ 直提升综计划（LIFTPLAN）
+   ============================================================ */
+let pendingSwitch = null;  // {target, conv} 待确认的切回踏板预览
+
+/* UI 切换：显示/隐藏对应网格、尺与说明（不动数据） */
+function applyModeUI() {
+  const isLift = state.mode === "lift";
+  $("#gridTieup").hidden = isLift;
+  $("#gridTreadling").hidden = isLift;
+  $("#treadleRuler").hidden = isLift;
+  $("#liftNote").hidden = !isLift;
+  $("#gridLiftplan").hidden = !isLift;
+  $("#liftColRuler").hidden = !isLift;
+  $("#legendTreadle").hidden = isLift;
+  $("#legendLift").hidden = !isLift;
+  $("#legendLiftSwatch").hidden = !isLift;
+  $("#legendLiftText").hidden = !isLift;
+  $("#boardLegendTitle").textContent = isLift ? "直提式四宫格：" : "四宫格：";
+  // 踏板数量只在踏板模式可改
+  $("#treadles").disabled = isLift;
+  // 顶部模式按钮
+  $$("#editMode button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.editmode === state.mode));
+  setBoardVars();
+  updateShedHint();
+}
+
+/* 踏板稿 → 升综计划：按现有连结 + 踏序逐纬求“升起”的综框。
+   LIFTPLAN 按 WIF 约定始终记录升起综框，与 Shed 无关；
+   沉综逻辑下由计算端把未列入的综视为升起（下沉综＝计划中列出者）。 */
+function treadleToLift() {
+  const { S, P } = state;
+  const lift = new Set();
+  let dead = 0;
+  // 每片综连结的踏板
+  const treadlesOfShaft = Array.from({ length: S }, () => []);
+  for (const k of state.tieup) {
+    const [s, t] = parseKey(k);
+    if (s < S && t < state.T) treadlesOfShaft[s].push(t);
+  }
+  for (let p = 0; p < P; p++) {
+    const pressed = new Set();
+    for (const k of state.treadling) {
+      const [pp, t] = parseKey(k);
+      if (pp === p && t < state.T) pressed.add(t);
+    }
+    if (!pressed.size) { lift.add(key(p, LIFT_DEAD)); dead++; continue; }
+    for (let s = 0; s < S; s++) {
+      const linked = treadlesOfShaft[s].some((t) => pressed.has(t));
+      // rising: 连结=升起 → 列入计划；sinking: 连结=沉下 → 未连结者升起，列入计划
+      const raised = state.shed === "sinking" ? !linked : linked;
+      if (raised) lift.add(key(p, s));
+    }
+  }
+  return { lift, dead };
+}
+
+/* 升综计划 → 踏板稿：按综框组合归并踏板（不含漏织纬）。
+   沉综开口下，连结标记表示沉下综框，故 tieup 列该纬“未升起”的综框。
+   返回 {tieup, treadling, T, deadPicks:[]} */
+function liftToTreadle() {
+  const { S, P } = state;
+  const groups = new Map();   // 签名 -> 踏板序号（0 起，按首次出现）
+  const tieup = new Set(), treadling = new Set();
+  const deadPicks = [];
+  const tieFor = (raised) => {
+    // 该踏板应连结的综框：提综=升起者；沉综=沉下者（升起集合的补集）
+    if (state.shed !== "sinking") return raised;
+    const set = new Set(raised);
+    const comp = [];
+    for (let s = 0; s < S; s++) if (!set.has(s)) comp.push(s);
+    return comp;
+  };
+  for (let p = 0; p < P; p++) {
+    if (isDeadLiftPick(p)) { deadPicks.push(p); continue; }
+    const raised = liftSetOfPick(p);
+    if (!raised.length) { deadPicks.push(p); continue; } // 空行按漏织处理
+    const sig = raised.join(",");
+    let t = groups.get(sig);
+    if (t === undefined) {
+      t = groups.size;
+      groups.set(sig, t);
+      for (const s of tieFor(raised)) tieup.add(key(s, t));
+    }
+    treadling.add(key(p, t));
+  }
+  return { tieup, treadling, T: groups.size, deadPicks };
+}
+
+/* 切换编辑区模式入口 */
+function switchEditMode(target) {
+  if (target === state.mode) return;
+  if (target === "lift") {
+    // 踏板 → 直提：直接生成并切入（原踏板稿保留在状态中，撤销可回）
+    const { lift, dead } = treadleToLift();
+    state.liftplan = lift;
+    state.mode = "lift";
+    stopPlay(); play.pick = -1;
+    cancelSelection(true);
+    syncSetupInputs();
+    applyModeUI();
+    rebuildAll();
+    pushHistory();
+    toast(`已按现有连结与踏序生成升综计划（${dead} 纬无有效踏板，记为漏织）`);
+    return;
+  }
+  // 直提 → 踏板：先预览，超出踏板数或成布不一致时不能覆盖
+  let hasOOR = false;
+  for (const k of state.liftplan) {
+    const [p, s] = parseKey(k);
+    if (s !== LIFT_DEAD && (p >= state.P || s >= state.S)) { hasOOR = true; break; }
+  }
+  if (hasOOR) {
+    toast("升综计划存在越界标记，请先在问题列表清除后再切回踏板", 3200);
+    return;
+  }
+  const conv = liftToTreadle();
+  // 成布差异：用当前穿综与开口逻辑，对比 直提成布 vs 转换稿成布
+  const curCloth = computeClothOf(state);
+  const trial = {
+    S: state.S, T: conv.T, E: state.E, P: state.P,
+    shed: state.shed, mode: "treadle",
+    threading: state.threading, tieup: conv.tieup, treadling: conv.treadling,
+  };
+  const newCloth = computeClothOf(trial);
+  let diffCount = 0;
+  const diffCells = [];
+  for (let i = 0; i < curCloth.length; i++) {
+    if (curCloth[i] !== newCloth[i]) {
+      diffCount++;
+      if (diffCells.length < 600) diffCells.push(i);
+    }
+  }
+  conv.diffCount = diffCount;
+  conv.diffCells = diffCells;
+  conv.overLimit = conv.T > state.T;
+  pendingSwitch = { target, conv };
+  showSwitchPreview(conv);
+}
+
+/* 模式切换预览模态 */
+function showSwitchPreview(conv) {
+  const body = document.createElement("div");
+  const over = conv.overLimit, diff = conv.diffCount > 0;
+  const statCls = over || diff ? "bad" : "ok";
+  let html = `<p style="margin:0 0 6px">按各纬综框组合归并踏板，预览切回<b>踏板组织图</b>后的结果
+      （当前为${state.shed === "rising" ? "提综" : "沉综"}逻辑）：</p>
+    <div class="conv-summary">
+      <span class="conv-stat ${statCls}">所需踏板 <b>${conv.T}</b> 片（设定 ${state.T}）</span>
+      <span class="conv-stat ${diff ? "bad" : "ok"}">成布差异 <b>${conv.diffCount}</b> 格</span>
+      <span class="conv-stat">漏织纬 <b>${conv.deadPicks.length}</b> 纬（不踩踏板）</span>
+    </div>`;
+  if (over)
+    html += `<div class="conv-warn">所需踏板 ${conv.T} 片超过设定数量 ${state.T}。
+      请先在设置条增加踏板数（或精简升综计划），否则不能覆盖原稿。</div>`;
+  if (diff)
+    html += `<div class="conv-warn">转换稿与当前成布有 ${conv.diffCount} 格不一致，无法保持成布一致，不能覆盖原稿。</div>`;
+  body.innerHTML = html;
+
+  // 三块小预览：连结、踏序、成布差异
+  const blocks = document.createElement("div");
+  blocks.className = "conv-blocks";
+  blocks.appendChild(renderConvBlock("新踏板连结（行=综，列=踏）", conv.tieup, state.S, conv.T,
+    (r, c) => conv.tieup.has(key(r, c)), "#8a5a2b"));
+  blocks.appendChild(renderConvBlock("新踏序（上=最新纬，列=踏）", conv.treadling, state.P, conv.T,
+    (r, c) => conv.treadling.has(key(state.P - 1 - r, c)), "#2456a6"));
+  // 成布差异小图
+  const cur = computeClothOf(state);
+  const trial = {
+    S: state.S, T: conv.T, E: state.E, P: state.P, shed: state.shed, mode: "treadle",
+    threading: state.threading, tieup: conv.tieup, treadling: conv.treadling,
+  };
+  const nv = computeClothOf(trial);
+  blocks.appendChild(clothDiffMiniSvg(cur, nv));
+  body.appendChild(blocks);
+
+  const canApply = !over && !diff;
+  openModal("切回踏板组织图 · 转换预览", body, [
+    { label: "取消", action: () => { pendingSwitch = null; closeModal(); } },
+    {
+      label: canApply ? "采用并切换" : "不能覆盖原稿",
+      primary: canApply,
+      action: () => { if (canApply) applySwitchToTreadle(); },
+    },
+  ], true);
+  if (!canApply) {
+    const last = $("#modalFoot").lastElementChild;
+    last.disabled = true;
+    last.title = over ? "所需踏板超过设定数量" : "成布不一致";
+  }
+}
+
+/* 小网格预览（通用黑白/单色点） */
+function renderConvBlock(title, set, rows, cols, has, color) {
+  const wrap = document.createElement("div");
+  wrap.className = "conv-block";
+  const px = clamp(Math.min(10, 320 / Math.max(rows, cols)), 3, 10);
+  let s = `<div class="cb-title">${escapeHtml(title)}</div>`;
+  s += `<svg width="${cols * px}" height="${rows * px}" viewBox="0 0 ${cols} ${rows}">`;
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++)
+      s += `<rect x="${c}" y="${r}" width="1.02" height="1.02"
+            fill="${has(r, c) ? color : "#fff"}" stroke="#e0dccf" stroke-width=".05"/>`;
+  s += `</svg>`;
+  wrap.innerHTML = s;
+  return wrap;
+}
+/* 成布差异小图：红=当前将消失，绿=转换新增，白/黑=一致 */
+function clothDiffMiniSvg(cur, nv) {
+  const wrap = document.createElement("div");
+  wrap.className = "conv-block";
+  const { E, P } = state;
+  const px = clamp(Math.min(7, 360 / Math.max(E, P)), 2, 7);
+  let s = `<div class="cb-title">成布对比（红消失 / 绿新增）</div>`;
+  s += `<svg width="${E * px}" height="${P * px}" viewBox="0 0 ${E} ${P}">`;
+  for (let p = 0; p < P; p++) {
+    for (let e = 0; e < E; e++) {
+      const a = cur[p * E + e], b = nv[p * E + e];
+      let fill;
+      if (a === b) fill = a === 1 ? "#2b2b28" : a === 0 ? "#fff" : "#d6d2c6";
+      else if (a === 1) fill = "#f2b8b0";
+      else fill = "#b7e4c0";
+      s += `<rect x="${e}" y="${P - 1 - p}" width="1.02" height="1.02" fill="${fill}" stroke="#e0dccf" stroke-width=".03"/>`;
+    }
+  }
+  s += `</svg>`;
+  wrap.innerHTML = s;
+  return wrap;
+}
+
+function applySwitchToTreadle() {
+  if (!pendingSwitch) return;
+  const conv = pendingSwitch.conv;
+  state.tieup = conv.tieup;
+  state.treadling = conv.treadling;
+  state.T = conv.T;   // 归并后的实际踏板数（不超过设定）
+  state.mode = "treadle";
+  pendingSwitch = null;
+  stopPlay(); play.pick = -1;
+  cancelSelection(true);
+  closeModal();
+  syncSetupInputs();
+  applyModeUI();
+  rebuildAll();
+  pushHistory();
+  toast(`已切回踏板模式：${conv.T} 片踏板，成布保持一致`);
+}
+
+/* ============================================================
    WIF 导入 / 导出
    ============================================================ */
 function exportWIF() {
   const { S, T, E, P } = state;
+  const isLift = state.mode === "lift";
   const lines = [];
   lines.push("[WIF]");
   lines.push("Version=1.1");
@@ -1441,14 +1909,14 @@ function exportWIF() {
   lines.push("WARP=yes");
   lines.push("WEFT=yes");
   lines.push("THREADING=yes");
-  lines.push("TIEUP=yes");
-  lines.push("TREADLING=yes");
+  if (isLift) lines.push("LIFTPLAN=yes");
+  else { lines.push("TIEUP=yes"); lines.push("TREADLING=yes"); }
   lines.push("COLOR PALETTE=yes");
   lines.push("[TEXT]");
   lines.push("Title=" + ($("#projectName").value || "未命名"));
   lines.push("[WEAVING]");
   lines.push("Shed=" + (state.shed === "rising" ? "Rising" : "Sinking"));
-  lines.push("Treadling=Single Tieup");
+  lines.push(isLift ? "Liftplan=yes" : "Treadling=Single Tieup");
   lines.push("[WARP]");
   lines.push(`Threads=${E}`);
   lines.push("Color Form=RGB");
@@ -1470,21 +1938,32 @@ function exportWIF() {
   }
   for (const [shaft, arr] of threadMap)
     lines.push(`${shaft}={${arr.join(",")}}`);
-  lines.push("[TIEUP]");
-  for (let s = 0; s < S; s++) {
-    const ts = [];
-    for (let t = 0; t < T; t++) if (state.tieup.has(key(s, t))) ts.push(t + 1);
-    if (ts.length) lines.push(`${s + 1}={${ts.join(",")}}`);
-  }
-  lines.push("[TREADLING]");
-  for (let p = 0; p < P; p++) {
-    const ts = [];
-    for (let t = 0; t < T; t++) if (state.treadling.has(key(p, t))) ts.push(t + 1);
-    lines.push(`${p + 1}=${ts.length ? "{" + ts.join(",") + "}" : "0"}`);
+
+  if (isLift) {
+    // 直提模式：按 LIFTPLAN 写出每纬升起的综框；漏织纬写 0
+    lines.push("[LIFTPLAN]");
+    for (let p = 0; p < P; p++) {
+      if (isDeadLiftPick(p)) { lines.push(`${p + 1}=0`); continue; }
+      const sh = liftSetOfPick(p).map((s) => s + 1);
+      lines.push(`${p + 1}=${sh.length ? "{" + sh.join(",") + "}" : "0"}`);
+    }
+  } else {
+    lines.push("[TIEUP]");
+    for (let s = 0; s < S; s++) {
+      const ts = [];
+      for (let t = 0; t < T; t++) if (state.tieup.has(key(s, t))) ts.push(t + 1);
+      if (ts.length) lines.push(`${s + 1}={${ts.join(",")}}`);
+    }
+    lines.push("[TREADLING]");
+    for (let p = 0; p < P; p++) {
+      const ts = [];
+      for (let t = 0; t < T; t++) if (state.treadling.has(key(p, t))) ts.push(t + 1);
+      lines.push(`${p + 1}=${ts.length ? "{" + ts.join(",") + "}" : "0"}`);
+    }
   }
   const blob = new Blob([lines.join("\r\n")], { type: "text/plain;charset=utf-8" });
   downloadBlob(blob, ($("#projectName").value || "wovenproof") + ".wif");
-  toast("已导出 WIF");
+  toast(isLift ? "已按直提模式导出 WIF（LIFTPLAN）" : "已导出 WIF（TIEUP/TREADLING）");
 }
 function downloadBlob(blob, name) {
   const a = document.createElement("a");
@@ -1502,7 +1981,7 @@ function importWIF(text) {
   const P = parseInt(weft.threads || "0", 10);
   const th = get("threading"), ti = get("tieup"), tr = get("treadling"), lp = get("liftplan");
   let S = 0, T = 0;
-  const threading = new Set(), tieup = new Set(), treadling = new Set();
+  const threading = new Set(), tieup = new Set(), treadling = new Set(), liftplan = new Set();
 
   for (const keyStr of Object.keys(th)) {
     const shaft = parseInt(keyStr, 10);
@@ -1512,59 +1991,66 @@ function importWIF(text) {
       if (Number.isFinite(e)) threading.add(key(shaft - 1, e - 1));
     }
   }
-  const useLift = Object.keys(lp).length > 0 && Object.keys(tr).length === 0;
-  const treadleMap = new Map(); // 踏板组合签名 -> 踏板号
+  // WIF 含 LIFTPLAN 时原样保留：进入直提模式，不合成踏板。
+  // 若同时带 TIEUP/TREADLING 也读入保留，方便日后切回踏板模式参考。
+  const useLift = Object.keys(lp).length > 0;
   if (useLift) {
-    // LIFTPLAN：键=纬号，值=提升的综列表；按提升组合合成 tieup + treadling
-    T = 0;
+    const seen = new Uint8Array(P);
     for (const keyStr of Object.keys(lp)) {
       const p = parseInt(keyStr, 10);
       if (!Number.isFinite(p)) continue;
-      const shafts = parseList(lp[keyStr]).sort((a, b) => a - b);
-      const sig = shafts.join(",");
-      let tnum = treadleMap.get(sig);
-      if (tnum === undefined) {
-        T++;
-        tnum = T;
-        treadleMap.set(sig, tnum);
+      const shafts = parseList(lp[keyStr]);
+      if (!shafts.length || (shafts.length === 1 && shafts[0] === 0)) {
+        liftplan.add(key(p - 1, LIFT_DEAD)); // 漏织纬
+      } else {
         for (const sh of shafts) {
-          tieup.add(key(sh - 1, tnum - 1));
-          S = Math.max(S, sh);
+          if (Number.isFinite(sh)) {
+            liftplan.add(key(p - 1, sh - 1));
+            S = Math.max(S, sh);  // LIFTPLAN 也决定综框数
+          }
         }
       }
-      treadling.add(key(p - 1, tnum - 1));
+      seen[p - 1] = 1;
     }
-  } else {
-    for (const keyStr of Object.keys(ti)) {
-      const shaft = parseInt(keyStr, 10);
-      if (!Number.isFinite(shaft)) continue;
-      S = Math.max(S, shaft);
-      for (const t of parseList(ti[keyStr])) {
-        if (Number.isFinite(t)) { tieup.add(key(shaft - 1, t - 1)); T = Math.max(T, t); }
-      }
-    }
-    for (const keyStr of Object.keys(tr)) {
-      const p = parseInt(keyStr, 10);
-      if (!Number.isFinite(p)) continue;
-      const list = parseList(tr[keyStr]);
-      if (list.length === 0 || (list.length === 1 && list[0] === 0)) continue;
-      for (const t of list) {
-        if (Number.isFinite(t)) { treadling.add(key(p - 1, t - 1)); T = Math.max(T, t); }
-      }
+    // 缺号的纬也按漏织补齐，保证纬数与 WEFT.THREADS 一致
+    for (let p = 0; p < P; p++) if (!seen[p]) liftplan.add(key(p, LIFT_DEAD));
+  }
+  for (const keyStr of Object.keys(ti)) {
+    const shaft = parseInt(keyStr, 10);
+    if (!Number.isFinite(shaft)) continue;
+    S = Math.max(S, shaft);
+    for (const t of parseList(ti[keyStr])) {
+      if (Number.isFinite(t)) { tieup.add(key(shaft - 1, t - 1)); T = Math.max(T, t); }
     }
   }
-  if (!E || !P || !S || !T)
-    throw new Error("WIF 缺少必要尺寸（WARP.THREADS / WEFT.THREADS / 穿综 / 踏板）");
+  for (const keyStr of Object.keys(tr)) {
+    const p = parseInt(keyStr, 10);
+    if (!Number.isFinite(p)) continue;
+    const list = parseList(tr[keyStr]);
+    if (list.length === 0 || (list.length === 1 && list[0] === 0)) continue;
+    for (const t of list) {
+      if (Number.isFinite(t)) { treadling.add(key(p - 1, t - 1)); T = Math.max(T, t); }
+    }
+  }
+  if (!E || !P || !S)
+    throw new Error("WIF 缺少必要尺寸（WARP.THREADS / WEFT.THREADS / 穿综）");
+  if (!useLift && !T)
+    throw new Error("WIF 缺少必要的踏板数据（TIEUP/TREADLING 或 LIFTPLAN）");
+  if (useLift && !T) T = 1; // 直提模式不需要踏板，留 1 片占位供设置条显示
 
   state.S = S; state.T = T; state.E = E; state.P = P;
   state.threading = threading; state.tieup = tieup; state.treadling = treadling;
+  state.liftplan = liftplan;
+  state.mode = useLift ? "lift" : "treadle";
   state.shed = String(weaving.shed || "").toLowerCase().startsWith("sink") ? "sinking" : "rising";
   state.warpColors = parseWIFColors(warp, E);
   state.weftColors = parseWIFColors(weft, P);
   const title = get("text").title;
   if (title) $("#projectName").value = title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
   syncSetupInputs();
+  applyModeUI();
   rebuildAll();
+  stopPlay(); play.pick = -1;
   pushHistory();
   return { E, P, S, T, liftplan: useLift };
 }
@@ -1695,19 +2181,27 @@ function detectPeriod(arr1D) {
 function doPrint() {
   const area = $("#printArea");
   const { E, P, S, T } = state;
+  const isLift = state.mode === "lift";
   const px = clamp(Math.min(14, 760 / Math.max(E, P + S + 2)), 3, 14);
   const dateStr = new Date().toLocaleDateString("zh-CN");
   let html = `<div class="print-sheet">
     <div class="print-title">${escapeHtml($("#projectName").value)} · 组织图</div>
-    <div class="print-meta">综框 ${S} · 踏板 ${T} · 经纱 ${E} · 纬纱 ${P} ·
+    <div class="print-meta">综框 ${S} · ${isLift ? "直提升综计划（无踏板）" : "踏板 " + T} · 经纱 ${E} · 纬纱 ${P} ·
       ${state.shed === "rising" ? "提综" : "沉综"} · 打印日期 ${dateStr}</div>`;
 
   html += printBlock("穿综", E, S, px, (x, y) => state.threading.has(key(y, x)),
                      { topNums: E, leftNums: S, periodCols: detectPeriod(buildThreadRowSig()) });
-  html += printBlock("踏板连结", T, S, px, (x, y) => state.tieup.has(key(y, x)),
-                     { topNums: T, leftNums: S });
-  html += printBlock("踏序", T, P, px, (x, y) => state.treadling.has(key(P - 1 - y, x)),
-                     { topNums: T, leftNums: P, leftReverse: true });
+  if (isLift) {
+    html += printBlock("升综计划 LIFTPLAN（列=综框，上=最新纬）", S, P, px,
+                       (x, y) => state.liftplan.has(key(P - 1 - y, x)),
+                       { topNums: S, leftNums: P, leftReverse: true,
+                         periodCols: detectPeriod(buildLiftColSig()) });
+  } else {
+    html += printBlock("踏板连结", T, S, px, (x, y) => state.tieup.has(key(y, x)),
+                       { topNums: T, leftNums: S });
+    html += printBlock("踏序", T, P, px, (x, y) => state.treadling.has(key(P - 1 - y, x)),
+                       { topNums: T, leftNums: P, leftReverse: true });
+  }
 
   // 成布（带色纱）
   computeCloth();
@@ -1730,9 +2224,9 @@ function doPrint() {
       s += `<rect x="${x}" y="${y}" width="${px}" height="${px}" fill="none" class="print-cell"/>`;
     }
   }
-  // 重复边界：经向穿综周期 + 纬向踏序周期
+  // 重复边界：经向穿综周期 + 纬向踏序/升综计划周期
   const periodE = detectPeriod(buildThreadRowSig());
-  const periodP = detectPeriod(buildPickSig());
+  const periodP = detectPeriod(state.mode === "lift" ? buildLiftPickSig() : buildPickSig());
   for (let e = periodE; e < E; e += periodE)
     s += `<line x1="${ox + e * px}" y1="${oy}" x2="${ox + e * px}" y2="${oy + P * px}" class="print-repeat"/>`;
   for (let p = periodP; p < P; p += periodP)
@@ -1768,6 +2262,23 @@ function buildPickSig() {
     const ts = [];
     for (let t = 0; t < state.T; t++) if (state.treadling.has(key(p, t))) ts.push(t);
     sig.push(ts.join(","));
+  }
+  return sig;
+}
+function buildLiftPickSig() {
+  const sig = [];
+  for (let p = 0; p < state.P; p++) {
+    sig.push(isDeadLiftPick(p) ? "_dead" : liftSetOfPick(p).join(","));
+  }
+  return sig;
+}
+function buildLiftColSig() {
+  // 升综计划列签名：每片综在各纬的起落序列
+  const sig = [];
+  for (let s = 0; s < state.S; s++) {
+    let str = "";
+    for (let p = 0; p < state.P; p++) str += state.liftplan.has(key(p, s)) ? "1" : "0";
+    sig.push(str);
   }
   return sig;
 }
@@ -1840,8 +2351,9 @@ async function saveVersion() {
 }
 function collectDraft() {
   return {
-    S: state.S, T: state.T, E: state.E, P: state.P, shed: state.shed,
+    S: state.S, T: state.T, E: state.E, P: state.P, shed: state.shed, mode: state.mode,
     threading: [...state.threading], tieup: [...state.tieup], treadling: [...state.treadling],
+    liftplan: [...state.liftplan],
     warpColors: state.warpColors, weftColors: state.weftColors,
     rules: state.rules,
   };
@@ -1849,14 +2361,18 @@ function collectDraft() {
 function loadDraft(d, name) {
   state.S = d.S; state.T = d.T; state.E = d.E; state.P = d.P;
   state.shed = d.shed || "rising";
+  state.mode = d.mode === "lift" ? "lift" : "treadle";
   state.threading = new Set(d.threading || []);
   state.tieup = new Set(d.tieup || []);
   state.treadling = new Set(d.treadling || []);
+  state.liftplan = new Set(d.liftplan || []);
   state.warpColors = d.warpColors || [];
   state.weftColors = d.weftColors || [];
   if (d.rules) state.rules = Object.assign(state.rules, d.rules);
   if (name) $("#projectName").value = name;
+  stopPlay(); play.pick = -1;
   syncSetupInputs();
+  applyModeUI();
   rebuildAll();
 }
 
@@ -2024,10 +2540,13 @@ function openExamples() {
       stopPlay();
       state.S = d.S; state.T = d.T; state.E = d.E; state.P = d.P;
       state.threading = d.threading; state.tieup = d.tieup; state.treadling = d.treadling;
+      state.liftplan = new Set();
+      state.mode = "treadle";
       state.warpColors = []; state.weftColors = [];
       state.shed = "rising";
       $("#projectName").value = "示例·" + name.split("（")[0];
       syncSetupInputs();
+      applyModeUI();
       rebuildAll();
       pushHistory();
       closeModal();
@@ -2054,6 +2573,12 @@ function syncSetupInputs() {
   updateShedHint();
 }
 function updateShedHint() {
+  if (state.mode === "lift") {
+    $("#shedHint").textContent = state.shed === "rising"
+      ? "直提·提综：LIFTPLAN 标记＝该综本纬升起，正面见经（黑格）"
+      : "直提·沉综：LIFTPLAN 仍标记升起综框；未标综沉下，正面见纬（白格）";
+    return;
+  }
   $("#shedHint").textContent = state.shed === "rising"
     ? "提综逻辑：连结标记＝该综上升，正面见经（黑格）"
     : "沉综逻辑：连结标记＝该综下沉，正面见纬（白格）";
@@ -2075,19 +2600,26 @@ function onResizeField(which, val) {
 function hasOutOfRange(which) {
   if (which === "shafts")
     return [...state.threading].some((k) => parseKey(k)[0] >= state.S) ||
-           [...state.tieup].some((k) => parseKey(k)[0] >= state.S);
+           [...state.tieup].some((k) => parseKey(k)[0] >= state.S) ||
+           (state.mode === "lift" && [...state.liftplan].some((k) => {
+             const s = parseKey(k)[1]; return s !== LIFT_DEAD && s >= state.S;
+           }));
   if (which === "treadles")
     return [...state.tieup].some((k) => parseKey(k)[1] >= state.T) ||
            [...state.treadling].some((k) => parseKey(k)[1] >= state.T);
   if (which === "ends")
     return [...state.threading].some((k) => parseKey(k)[1] >= state.E);
-  return [...state.treadling].some((k) => parseKey(k)[0] >= state.P);
+  return [...state.treadling].some((k) => parseKey(k)[0] >= state.P) ||
+         (state.mode === "lift" && [...state.liftplan].some((k) => parseKey(k)[0] >= state.P));
 }
 function clearAll() {
-  if (!confirm("清空穿综、踏板连结、踏序三个输入网格？（可撤销）")) return;
+  if (!confirm(state.mode === "lift"
+      ? "清空穿综与升综计划输入网格？（可撤销）"
+      : "清空穿综、踏板连结、踏序三个输入网格？（可撤销）")) return;
   state.threading.clear();
   state.tieup.clear();
   state.treadling.clear();
+  state.liftplan.clear();
   stopPlay(); play.pick = -1;
   cancelSelection(true);
   afterEdit();
@@ -2116,9 +2648,8 @@ function init() {
     try {
       const text = await f.text();
       const info = importWIF(text);
-      pushHistory();
-      toast(`已导入 WIF：${info.E}经×${info.P}纬，${info.S}综${info.T}踏` +
-            (info.liftplan ? "（由 LIFTPLAN 转换）" : ""), 3000);
+      toast(`已导入 WIF：${info.E}经×${info.P}纬，${info.S}综` +
+            (info.liftplan ? `（直提模式，LIFTPLAN 原样保留）` : `，${info.T}踏`), 3000);
     } catch (e) { toast("WIF 导入失败：" + e.message, 3500); }
     ev.target.value = "";
   });
@@ -2141,6 +2672,11 @@ function init() {
     edit.mode = b.dataset.mode;
     $$("#toolMode button").forEach((x) => x.classList.toggle("active", x === b));
     if (edit.mode !== "select") cancelSelection();
+  });
+  $("#editMode").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    switchEditMode(b.dataset.editmode);
   });
 
   // 选区
@@ -2223,9 +2759,11 @@ function init() {
       if (d && d.threading) {
         state.S = d.S; state.T = d.T; state.E = d.E; state.P = d.P;
         state.shed = d.shed || "rising";
+        state.mode = d.mode === "lift" ? "lift" : "treadle";
         state.threading = new Set(d.threading);
-        state.tieup = new Set(d.tieup);
-        state.treadling = new Set(d.treadling);
+        state.tieup = new Set(d.tieup || []);
+        state.treadling = new Set(d.treadling || []);
+        state.liftplan = new Set(d.liftplan || []);
         state.warpColors = d.warpColors || [];
         state.weftColors = d.weftColors || [];
         $("#projectName").value = d.name || "未命名项目";
@@ -2237,9 +2775,12 @@ function init() {
     const d = EXAMPLES["平纹（2综2踏）"]();
     state.S = d.S; state.T = d.T; state.E = d.E; state.P = d.P;
     state.threading = d.threading; state.tieup = d.tieup; state.treadling = d.treadling;
+    state.mode = "treadle";
+    state.liftplan = new Set();
     $("#projectName").value = "示例·平纹";
   }
   syncSetupInputs();
+  applyModeUI();
   rebuildAll();
   history.stack = [snapshot()];
   history.index = 0;

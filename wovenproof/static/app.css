@@ -53,6 +53,7 @@ input[type="number"], input[type="text"], select {
   color: var(--ink);
 }
 input[type="number"] { width: 64px; }
+input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
 .small, small { font-size: 11px; color: var(--muted); }
 .muted { color: var(--muted); }
 .spacer { flex: 1; }
@@ -115,10 +116,10 @@ input[type="number"] { width: 64px; }
 }
 .board-legend b { color: var(--accent); }
 
-/* 扁平四宫格：3 列（尺宽 | 踏板连结/踏序 | 穿综/成布）× 4 行 */
+/* 扁平四宫格：3 列（尺宽 | 连结/踏序/升综计划 | 穿综/成布）× 4 行 */
 .board {
   display: grid;
-  grid-template-columns: var(--ruler) calc(var(--T, 4) * var(--cell)) calc(var(--E, 24) * var(--cell));
+  grid-template-columns: var(--ruler) calc(var(--M, var(--T, 4)) * var(--cell)) calc(var(--E, 24) * var(--cell));
   grid-template-rows: var(--cell) calc(var(--S, 4) * var(--cell)) var(--cell) calc(var(--P, 24) * var(--cell));
   column-gap: 6px;
   row-gap: 4px;
@@ -185,6 +186,11 @@ input[type="number"] { width: 64px; }
   border-radius: 3px;
   font-weight: 700;
 }
+.rnum.warn-mark {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-radius: 3px;
+}
 .rnum.loc-flash { outline: 2px solid var(--blue); outline-offset: -2px; z-index: 4; }
 @keyframes pulse-bad {
   0%, 100% { box-shadow: 0 0 0 0 rgba(192,57,43,.35); }
@@ -215,6 +221,7 @@ input[type="number"] { width: 64px; }
 .grid.threading .cell.mark { background: #2b2b28; }
 .grid.tieup .cell.mark { background: #8a5a2b; border-radius: 40%; }
 .grid.treadling .cell.mark { background: #2456a6; border-radius: 40%; }
+.grid.liftplan .cell.mark { background: #2e7d4f; border-radius: 30%; }
 
 .cell.hover { outline: 2px solid var(--amber); outline-offset: -2px; z-index: 2; }
 
@@ -230,6 +237,7 @@ input[type="number"] { width: 64px; }
 /* 播放高亮 */
 .cell.play-shaft { background: #d9a767 !important; box-shadow: inset 0 0 0 2px var(--accent); }
 .grid.treadling .cell.play-treadle { background: #7ea4dd !important; box-shadow: inset 0 0 0 2px var(--blue); }
+.grid.liftplan .cell.play-shaft { background: #7fc79b !important; box-shadow: inset 0 0 0 2px var(--green); }
 
 /* 选区矩形 */
 .sel-rect {
@@ -255,7 +263,25 @@ input[type="number"] { width: 64px; }
 .ends-ruler { grid-column: 3; grid-row: 3; }
 .picks-ruler { grid-column: 1; grid-row: 4; }
 .treadling-grid { grid-column: 2; grid-row: 4; }
+.liftplan-grid { grid-column: 2; grid-row: 4; }
 .drawdown-svg-wrap { grid-column: 3; grid-row: 4; }
+
+/* 直提模式：中列说明块、升综计划列尺 */
+.lift-note {
+  grid-column: 2; grid-row: 2;
+  outline: 1px dashed var(--line);
+  background: #f7f4ec;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.lift-note b { color: var(--green); font-size: 12px; }
+.ruler-bottom.lift-ruler { grid-column: 2; grid-row: 3; }
+.lg-lift { background: #2e7d4f; border-radius: 2px; }
 
 .svg-box {
   width: calc(var(--E, 24) * var(--cell));
@@ -462,6 +488,28 @@ input[type="number"] { width: 64px; }
 .diff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .diff-grid h4 { margin: 0 0 6px; text-align: center; color: var(--accent); }
 .diff-cell-wrap { overflow: auto; border: 1px solid var(--line); }
+
+/* 模式切换预览 */
+.conv-summary {
+  display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 10px;
+}
+.conv-stat {
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 5px 10px; background: #fdfcf8; font-size: 12px;
+}
+.conv-stat b { color: var(--accent); }
+.conv-stat.bad { border-color: var(--red); background: var(--red-soft); }
+.conv-stat.bad b { color: var(--red); }
+.conv-stat.ok { border-color: var(--green); background: #dff0e4; }
+.conv-stat.ok b { color: var(--green); }
+.conv-warn {
+  border-left: 4px solid var(--red); background: var(--red-soft);
+  border-radius: 4px; padding: 7px 10px; margin: 6px 0; font-size: 12px;
+}
+.conv-blocks { display: flex; flex-wrap: wrap; gap: 10px; }
+.conv-block { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: #fff; }
+.conv-block .cb-title { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-align: center; }
+.conv-block svg { display: block; }
 
 /* ---------- 打印 ---------- */
 .print-area { display: none; }
