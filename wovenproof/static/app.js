@@ -1702,7 +1702,6 @@ function clothSvgEl(arr, E, P, px, diffA, diffB) {
 /* ============================================================
    编辑区模式：踏板组织图 ⇄ 直提升综计划（LIFTPLAN）
    ============================================================ */
-let pendingSwitch = null;  // {target, conv} 待确认的切回踏板预览
 
 /* UI 切换：显示/隐藏对应网格、尺与说明（不动数据） */
 function applyModeUI() {
@@ -1775,40 +1774,461 @@ function treadleToLift() {
   return { lift, dead };
 }
 
-/* 升综计划 → 踏板稿：按综框组合归并踏板。
-   - 哨兵纬（真正漏织）不踩踏板；
-   - 全沉纬（空签名）归到一个“空连结踏板”，提综逻辑下踩它＝全综沉下；
-   - 沉综开口下，连结标记表示沉下综框，故 tieup 列该纬“未升起”的综框。
-   返回 {tieup, treadling, T, deadPicks:[]} */
-function liftToTreadle() {
-  const { S, P } = state;
-  const groups = new Map();   // 签名 -> 踏板序号（0 起，按首次出现）
-  const tieup = new Set(), treadling = new Set();
-  const deadPicks = [];
-  const tieFor = (raised) => {
-    // 该踏板应连结的综框：提综=升起者；沉综=沉下者（升起集合的补集）
-    if (state.shed !== "sinking") return raised;
-    const set = new Set(raised);
-    const comp = [];
-    for (let s = 0; s < S; s++) if (!set.has(s)) comp.push(s);
-    return comp;
-  };
-  for (let p = 0; p < P; p++) {
-    if (isDeadLiftPick(p)) { deadPicks.push(p); continue; }
-    const raised = liftSetOfPick(p);   // 空数组＝有效全沉纬
-    const sigStr = raised.join(",");   // "" 即空连结踏板
-    let t = groups.get(sigStr);
-    if (t === undefined) {
-      t = groups.size;
-      groups.set(sigStr, t);
-      for (const s of tieFor(raised)) tieup.add(key(s, t));
-    }
-    treadling.add(key(p, t));
-  }
-  return { tieup, treadling, T: groups.size, deadPicks };
+/* ============================================================
+   复合踏板求解：直提升综稿 → 踏板稿（允许一纬同踩多片踏板）
+   ------------------------------------------------------------
+   每纬的目标开口（升综综框集合）要表达为“若干踏板连结的并集”：
+     提综逻辑：踏板连结＝升起综框，并集须恰好等于目标升综集；
+     沉综逻辑：踏板连结＝沉下综框，并集须恰好等于升综集的补集。
+   限制：踏板总预算 B、每纬最多同踩 K 片；可选把直提稿中保留的
+   旧连结列（state.tieup）锁为固定列，求解器只能在其后增补新列。
+   ============================================================ */
+const SOLVER_LS = "wovenproof_solver_v1";
+let solverPrefs = loadSolverPrefs();
+function loadSolverPrefs() {
+  try {
+    return Object.assign({ K: 2, lock: false }, JSON.parse(localStorage.getItem(SOLVER_LS) || "{}"));
+  } catch (e) { return { K: 2, lock: false }; }
+}
+function saveSolverPrefs() {
+  try { localStorage.setItem(SOLVER_LS, JSON.stringify(solverPrefs)); } catch (e) {}
 }
 
-/* 切换编辑区模式入口 */
+/* 32 位集合运算（综框最多 32 片，掩码按 uint32 处理） */
+function popcount32(x) {
+  x = x >>> 0;
+  x = x - ((x >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return ((((x + (x >>> 4)) & 0x0f0f0f0f) >>> 0) * 0x01010101) >>> 24;
+}
+function lowBit32(x) { return (x & -x) >>> 0; }
+function bitsOf32(m) {
+  const out = [];
+  m = m >>> 0;
+  for (let s = 0; s < 32; s++) if ((m >>> s) & 1) out.push(s);
+  return out;
+}
+
+/* 直提稿中保留的旧踏板稿信息：列数与每列连结掩码（可能为空） */
+function retainedTreadleInfo() {
+  let n = 0;
+  for (const k of state.tieup) {
+    const [s, t] = parseKey(k);
+    if (s < state.S) n = Math.max(n, t + 1);
+  }
+  for (const k of state.treadling) {
+    const [, t] = parseKey(k);
+    n = Math.max(n, t + 1);
+  }
+  const masks = [];
+  for (let t = 0; t < n; t++) {
+    let m = 0;
+    for (let s = 0; s < state.S; s++) if (state.tieup.has(key(s, t))) m |= (1 << s) >>> 0;
+    masks.push(m >>> 0);
+  }
+  return { n, masks, has: n > 0 };
+}
+
+/* 每纬目标：upMasks=升综综框（WIF 约定，与开口逻辑无关）；
+   tieMasks=该纬踩下踏板连结的并集目标；dead=漏织哨兵 */
+function solverTargets() {
+  const { S, P } = state;
+  const FULL = S >= 32 ? 0xffffffff : ((1 << S) >>> 0) - 1;
+  const upMasks = new Array(P).fill(0);
+  const tieMasks = new Array(P).fill(0);
+  const dead = new Uint8Array(P);
+  for (let p = 0; p < P; p++) {
+    if (isDeadLiftPick(p)) { dead[p] = 1; continue; }
+    let up = 0;
+    for (const k of state.liftplan) {
+      const [pp, s] = parseKey(k);
+      if (pp === p && s >= 0 && s < S) up |= (1 << s) >>> 0;
+    }
+    up >>>= 0;
+    upMasks[p] = up;
+    tieMasks[p] = state.shed === "sinking" ? ((~up) & FULL) >>> 0 : up;
+  }
+  return { upMasks, tieMasks, dead, FULL };
+}
+
+/* 枚举用不超过 K 个块（blocks 中元素的掩码都须是 m 的子集）覆盖 m 的全部方案。
+   按索引号 include/exclude 深度优先，每个索引集合只产生一次；允许块间重叠。
+   返回下标数组的数组。 */
+function enumCovers(m, blocks, K, optCap, nodeCap) {
+  const res = [];
+  const chosen = [];
+  let nodes = 0;
+  let truncated = false;
+  function rec(rem, i) {
+    if (res.length >= optCap) return;
+    if (nodes++ > nodeCap) { truncated = true; return; }
+    if (rem === 0) { res.push(chosen.slice()); return; }
+    if (chosen.length >= K || i >= blocks.length) return;
+    // 先尝试不含第 i 块……
+    rec(rem, i + 1);
+    // ……再尝试把第 i 块并入（它至少要覆盖尚未覆盖的综框）
+    const bm = blocks[i].mask;
+    if (bm & rem) {
+      chosen.push(i);
+      rec((rem & ~bm) >>> 0, i + 1);
+      chosen.pop();
+    }
+  }
+  rec(m >>> 0, 0);
+  return { res, truncated };
+}
+
+/* 求解主入口。返回
+   {ok:true, sols:[...]} 或 {ok:false, fail:{reason, groups:[{up,picks}], ...}} */
+function solveCompound(budget, K, lock) {
+  const P = state.P;
+  const { upMasks, tieMasks, dead, FULL } = solverTargets();
+  const retained = retainedTreadleInfo();
+  let lockMasks = [];
+  if (lock && retained.has) {
+    if (retained.n > budget) {
+      return { ok: false, fail: { reason: "lockover", nLock: retained.n, budget,
+        groups: collectFailGroups(tieMasks, upMasks, dead, P, null) } };
+    }
+    lockMasks = retained.masks.slice();
+  }
+  const nLock = lockMasks.length;
+
+  // 不同的有效开口（连结并集目标）；0=全沉纬专用（rising 空连结 / sinking 全连结）
+  const rowOfMask = new Map();
+  for (let p = 0; p < P; p++) {
+    if (dead[p]) continue;
+    const m = tieMasks[p];
+    if (!rowOfMask.has(m)) rowOfMask.set(m, []);
+    rowOfMask.get(m).push(p);
+  }
+  const hasZero = rowOfMask.has(0);
+  const rows = [...rowOfMask.keys()].filter((m) => m !== 0);
+  const budgetNew = budget - nLock;
+
+  // 全部纬都是漏织哨兵：没有任何有效开口可归并
+  if (!rows.length && !hasZero) {
+    return { ok: false, fail: { reason: "alldead", budget, nLock, groups: [] } };
+  }
+
+  /* ---- 新块候选池：行掩码 + 单片综 + 有限次交闭包 ---- */
+  const POOL_CAP = 520;
+  const pset = new Set(rows);
+  let usedBits = 0;
+  for (const m of rows) usedBits |= m;
+  for (let s = 0; s < state.S; s++)
+    if ((usedBits >>> s) & 1) pset.add((1 << s) >>> 0);
+  for (let pass = 0; pass < 2 && pset.size < POOL_CAP; pass++) {
+    const before = pset.size;
+    const adds = new Set();
+    // 以行掩码为锚：新块必须是某行目标的子集才有资格被踩
+    for (const row of rows) {
+      for (const b of pset) {
+        if (pset.size + adds.size >= POOL_CAP) break;
+        const c = (row & b) >>> 0;
+        if (c && c !== b) adds.add(c);
+      }
+      if (pset.size + adds.size >= POOL_CAP) break;
+    }
+    for (const a of adds) pset.add(a);
+    if (pset.size === before) break;
+  }
+  for (const lm of lockMasks) pset.delete(lm); // 与固定列同掩码：白用固定列
+  pset.delete(0);
+  const pool = [...pset];
+
+  /* ---- 每个行掩码的覆盖选项：{news:[新块id...], size} ---- */
+  const rowOpts = rows.map((m) => {
+    const blocks = [];
+    for (let t = 0; t < lockMasks.length; t++)
+      if (lockMasks[t] !== 0 && (lockMasks[t] & ~m) === 0)
+        blocks.push({ mask: lockMasks[t], lock: true, idx: t });
+    for (let id = 0; id < pool.length; id++)
+      if ((pool[id] & ~m) === 0) blocks.push({ mask: pool[id], lock: false, idx: id });
+    blocks.sort((a, b) => popcount32(b.mask) - popcount32(a.mask));
+    const { res } = enumCovers(m, blocks, K, 900, 60000);
+    const best = new Map(); // 相同新块集合只留踩板数最少的
+    for (const ix of res) {
+      const news = [];
+      for (const i of ix) if (!blocks[i].lock) news.push(blocks[i].idx);
+      news.sort((a, b) => a - b);
+      const sig = news.join(",");
+      if (!best.has(sig) || ix.length < best.get(sig).size)
+        best.set(sig, { news, size: ix.length });
+    }
+    return [...best.values()].sort((a, b) => a.news.length - b.news.length || a.size - b.size);
+  });
+
+  /* ---- 回溯：为每个行掩码选一组覆盖，最少新增块 ---- */
+  const order = rows.map((m, i) => i).sort((a, b) => rowOpts[a].length - rowOpts[b].length);
+  const leaves = new Map(); // 掩码签名 -> {used:Set, maxSize}
+  const LEAF_CAP = 48;
+  const NODE_CAP = 45000;
+  let nodes = 0;
+  let searchCapped = false;
+  const deadline = Date.now() + 450;
+  let bestCount = Infinity;
+
+  // 全局快速容许下界：每个不同行掩码至少要新增的块数取最大；
+  // 下界已超预算时直接判无解，避免大规模回溯
+  const reserveZero0 = hasZero && lockMasks.indexOf(0) < 0 ? 1 : 0;
+  let globalLB = 0;
+  for (const opts of rowOpts) {
+    let mn = Infinity;
+    for (const o of opts) if (o.news.length < mn) mn = o.news.length;
+    if (mn > globalLB) globalLB = mn;
+  }
+  if (globalLB + reserveZero0 > budgetNew) {
+    const fail = greedyFailure(rowOpts, order, rows, pool, lockMasks, nLock, budget, budgetNew,
+                               hasZero, tieMasks, upMasks, dead, P, FULL);
+    fail.capped = false;
+    return { ok: false, fail };
+  }
+
+  // 贪心预解：给 bestCount 一个紧上界，使后续分支尽早被剪掉
+  {
+    const used = new Set();
+    for (const ri of order) {
+      let best = null, cost = Infinity;
+      for (const o of rowOpts[ri]) {
+        let c = 0;
+        for (const id of o.news) if (!used.has(id)) c++;
+        if (c < cost) { cost = c; best = o; }
+      }
+      if (best) for (const id of best.news) used.add(id);
+    }
+    if (used.size + reserveZero0 <= budgetNew) bestCount = used.size;
+  }
+
+  // 预计算每个行选项的“新增块”掩码（pool 最多 520，用两个 32 位字）
+  const optMasks = rowOpts.map((opts) => opts.map((o) => {
+    let lo = 0, hi = 0;
+    for (const id of o.news) { if (id < 32) lo |= 1 << id; else hi |= 1 << (id - 32); }
+    return { lo: lo >>> 0, hi: hi >>> 0, size: o.size, news: o.news };
+  }));
+  const orLo = (a, b) => (a.lo | b.lo) >>> 0, orHi = (a, b) => (a.hi | b.hi) >>> 0;
+
+  function lbRemaining(depth, ulo, uhi) {
+    // 容许下界：剩余各行至少各自要补的新块数取最大（只抽查部分行）
+    let lb = 0;
+    for (let d = depth; d < order.length && d < depth + 32; d++) {
+      const opts = optMasks[order[d]];
+      let mn = Infinity;
+      for (const o of opts) {
+        const c = popcount32(o.lo & ~ulo) + popcount32(o.hi & ~uhi);
+        if (c < mn) mn = c;
+        if (mn === 0) break;
+      }
+      if (mn > lb) lb = mn;
+    }
+    return lb;
+  }
+  // 全沉纬要占一列空连结踏板（优先借用固定列中的空列）；预算结算与开口逻辑无关
+  const reserveZero = hasZero && lockMasks.indexOf(0) < 0;
+  function dfs(depth, usedLo, usedHi, usedCount) {
+    if (nodes++ > NODE_CAP || Date.now() > deadline) { searchCapped = true; return; }
+    if (usedCount > bestCount) return;
+    const reserve = reserveZero ? 1 : 0;
+    if (usedCount + reserve > budgetNew) return;
+    if (usedCount + lbRemaining(depth, usedLo, usedHi) + reserve > budgetNew) return;
+    if (depth === order.length) {
+      const used = [];
+      for (let id = 0; id < pool.length; id++)
+        if ((id < 32 ? (usedLo >>> id) & 1 : (usedHi >>> (id - 32)) & 1)) used.push(id);
+      const sig = used.map((id) => pool[id]).sort((a, b) => a - b).join(",");
+      if (!leaves.has(sig)) {
+        leaves.set(sig, { used: new Set(used), maxSize: 0 });
+        if (usedCount < bestCount) bestCount = usedCount;
+        if (leaves.size >= LEAF_CAP) { searchCapped = true; return; }
+      }
+      return;
+    }
+    const ri = order[depth];
+    // 先试新增块最少的踩法，尽快找到小基以强剪后续分支
+    const ranked = optMasks[ri].map((o) => ({
+      o, add: popcount32(o.lo & ~usedLo) + popcount32(o.hi & ~usedHi),
+    })).sort((a, b) => a.add - b.add || a.o.lo - b.o.lo);
+    for (const { o, add } of ranked) {
+      if (usedCount + add + reserve > budgetNew) continue;
+      dfs(depth + 1, orLo({ lo: usedLo }, o), orHi({ hi: usedHi }, o), usedCount + add);
+      if (searchCapped) return;
+    }
+  }
+  dfs(0, 0, 0, 0);
+
+  /* ---- 评估每个基：排板、逐纬脚法 Viterbi 最省换脚 ---- */
+  const sols = [];
+  const evalCache = new Map(); // 列掩码集合签名 -> 每行掩码的踩法缓存
+  for (const leaf of leaves.values()) {
+    const sol = evaluateBasis(leaf.used, pool, lockMasks, nLock, tieMasks, dead,
+                              K, budget, FULL, evalCache);
+    if (sol) sols.push(sol);
+  }
+  sols.sort((a, b) =>
+    a.planT - b.planT || a.maxPress - b.maxPress || a.foot - b.foot || a.usedCount - b.usedCount);
+  const top = sols.slice(0, 8);
+
+  if (top.length) return { ok: true, sols: top, capped: searchCapped, budget, K, lock, nLock };
+
+  /* ---- 限制内无解：贪心找出放不下的开口 ---- */
+  const fail = greedyFailure(rowOpts, order, rows, pool, lockMasks, nLock, budget, budgetNew,
+                             hasZero, tieMasks, upMasks, dead, P, FULL);
+  fail.capped = searchCapped;
+  return { ok: false, fail };
+}
+
+function collectFailGroups(tieMasks, upMasks, dead, P, badSet) {
+  const groups = new Map();
+  for (let p = 0; p < P; p++) {
+    if (dead[p]) continue;
+    if (badSet && !badSet.has(tieMasks[p])) continue;
+    const m = upMasks[p];
+    if (!groups.has(m)) groups.set(m, []);
+    groups.get(m).push(p);
+  }
+  return [...groups.entries()].map(([up, picks]) => ({ up, picks }));
+}
+
+function greedyFailure(rowOpts, order, rows, pool, lockMasks, nLock, budget, budgetNew,
+                       hasZero, tieMasks, upMasks, dead, P, FULL) {
+  const used = new Set();
+  const bad = new Set();
+  // 用得越频繁的行优先给块
+  const ord = order.slice().sort((a, b) => rowOfMaskSize(rows[b]) - rowOfMaskSize(rows[a]));
+  function rowOfMaskSize(i) { let c = 0; for (let p = 0; p < P; p++) if (!dead[p] && tieMasks[p] === rows[i]) c++; return c; }
+  const reserveZero = hasZero && lockMasks.indexOf(0) < 0 ? 1 : 0;
+  for (const ri of ord) {
+    const opts = rowOpts[ri];
+    let picked = null, cost = Infinity;
+    for (const o of opts) {
+      let c = 0;
+      for (const id of o.news) if (!used.has(id)) c++;
+      if (c < cost) { cost = c; picked = o; }
+    }
+    if (picked && used.size + cost + reserveZero <= budgetNew) {
+      for (const id of picked.news) used.add(id);
+    } else bad.add(rows[ri]);
+  }
+  // 全沉纬需要一个空连结列：优先借用固定空列，否则占一个新列名额
+  if (reserveZero && used.size + 1 > budgetNew) bad.add(0);
+  return { reason: "budget", budget, nLock,
+           groups: collectFailGroups(tieMasks, upMasks, dead, P, bad) };
+}
+
+/* 给定“新增块集合”，排出具体踏板列并求最省换脚的逐纬踩法 */
+function evaluateBasis(usedIds, pool, lockMasks, nLock, tieMasks, dead, K, budget, FULL, evalCache) {
+  const P = state.P;
+  // 列：先固定列（掩码/位置不变），再把新块打包到其后
+  const cols = lockMasks.map((m, t) => ({ t, mask: m >>> 0, lock: true }));
+  for (const id of usedIds) cols.push({ t: cols.length, mask: pool[id] >>> 0, lock: false });
+  // 全沉纬（仅提综逻辑下 tieMask=0）专用列：踩一个“空连结踏板”即空并集
+  let zeroP = -1;
+  const needZero = tieMasks.some((m, p) => !dead[p] && m === 0);
+  if (needZero) {
+    zeroP = cols.findIndex((c) => c.mask === 0);
+    if (zeroP < 0) { zeroP = cols.length; cols.push({ t: zeroP, mask: 0, lock: false }); }
+  }
+  const planT = cols.length;
+  if (planT > budget) return null;
+
+  // 每纬可选踩法（列号集合），死纬只能空踩；同列布局下按行掩码缓存
+  const layoutSig = cols.map((c) => c.mask).join(",");
+  let coverCache = evalCache.get(layoutSig);
+  if (!coverCache) { coverCache = new Map(); evalCache.set(layoutSig, coverCache); }
+  const coverOf = (m) => {
+    if (coverCache.has(m)) return coverCache.get(m);
+    const usable = cols.map((c, i) => ({ mask: c.mask, i }))
+                       .filter((b) => b.mask !== 0 && (b.mask & ~m) === 0);
+    usable.sort((a, b) => popcount32(b.mask) - popcount32(a.mask));
+    const { res } = enumCovers(m, usable, K, 2000, 40000);
+    const seen = new Set();
+    let list = res.map((ix) => ix.map((i) => usable[i].i)).filter((a) => {
+      a.sort((x, y) => x - y);
+      const sig = a.join(",");
+      if (seen.has(sig)) return false;
+      seen.add(sig);
+      return true;
+    }).sort((a, b) => a.length - b.length).slice(0, 90);
+    coverCache.set(m, list);
+    return list;
+  };
+
+  const opts = [];
+  for (let p = 0; p < P; p++) {
+    if (dead[p]) { opts.push([[]]); continue; }
+    const m = tieMasks[p];
+    if (m === 0) { opts.push([[zeroP]]); continue; }
+    const list = coverOf(m);
+    if (!list.length) return null;
+    opts.push(list);
+  }
+
+  // Viterbi：相邻两纬换脚 = 踩板集合对称差大小；与死纬相邻 = 抬起/落下的脚数
+  const trans = (a, b) => {
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    return popcount32((xorSets(a, b)));
+  };
+  function xorSets(a, b) {
+    let m = 0;
+    for (const t of a) m ^= 1 << t;
+    for (const t of b) m ^= 1 << t;
+    return m >>> 0;
+  }
+  // 回溯
+  const press = new Array(P);
+  // 记录每一步的层表（第 0 层不记录父指针）
+  const layers = [opts[0].map((o) => ({ cost: o.length, par: -1 }))];
+  for (let p = 1; p < P; p++) {
+    const prev = layers[p - 1];
+    layers.push(opts[p].map((o) => {
+      let best = Infinity, bi = -1;
+      for (let i = 0; i < prev.length; i++) {
+        const c = prev[i].cost + trans(opts[p - 1][i], o);
+        if (c < best) { best = c; bi = i; }
+      }
+      return { cost: best, par: bi };
+    }));
+  }
+  let j = layers[P - 1].reduce((bi, x, i) => x.cost < layers[P - 1][bi].cost ? i : bi, 0);
+  for (let p = P - 1; p > 0; p--) {
+    press[p] = opts[p][j];
+    j = layers[p][j].par;
+  }
+  press[0] = opts[0][j];
+  // 换脚次数只算相邻纬（不含第一纬落脚）
+  let foot = 0, maxPress = 0;
+  const usedT = new Set();
+  for (let p = 0; p < P; p++) {
+    maxPress = Math.max(maxPress, press[p].length);
+    for (const t of press[p]) usedT.add(t);
+    if (p > 0) foot += trans(press[p - 1], press[p]);
+  }
+
+  // 产出 tieup / treadling 集合
+  const tieup = new Set(), treadling = new Set();
+  cols.forEach((c, t) => {
+    for (let s = 0; s < state.S; s++) if ((c.mask >>> s) & 1) tieup.add(key(s, t));
+  });
+  for (let p = 0; p < P; p++)
+    for (const t of press[p]) treadling.add(key(p, t));
+
+  // 成布一致性核对（机器解应为 0 差异）
+  const trial = {
+    S: state.S, T: planT, E: state.E, P, shed: state.shed, mode: "treadle",
+    threading: state.threading, tieup, treadling,
+  };
+  const cur = computeClothOf(state), nv = computeClothOf(trial);
+  let diff = 0;
+  for (let i = 0; i < cur.length; i++) if (cur[i] !== nv[i]) diff++;
+
+  return { planT, usedCount: usedT.size, maxPress, foot, tieup, treadling,
+           press, cols, diff, lockCount: nLock };
+}
+
+/* ---------------- 求解器模态 ---------------- */
+let solverUI = null;
+
 function switchEditMode(target) {
   if (target === state.mode) return;
   if (target === "lift") {
@@ -1825,7 +2245,7 @@ function switchEditMode(target) {
     toast(`已按现有连结与踏序生成升综计划（${dead} 纬无有效踏板，记为漏织）`);
     return;
   }
-  // 直提 → 踏板：先预览，超出踏板数或成布不一致时不能覆盖
+  // 直提 → 踏板：复合踏板求解，先出候选预览，零差异才能采用
   let hasOOR = false;
   for (const k of state.liftplan) {
     const [p, s] = parseKey(k);
@@ -1835,102 +2255,199 @@ function switchEditMode(target) {
     toast("升综计划存在越界标记，请先在问题列表清除后再切回踏板", 3200);
     return;
   }
-  const conv = liftToTreadle();
-  // 成布差异：用当前穿综与开口逻辑，对比 直提成布 vs 转换稿成布
-  const curCloth = computeClothOf(state);
-  const trial = {
-    S: state.S, T: conv.T, E: state.E, P: state.P,
-    shed: state.shed, mode: "treadle",
-    threading: state.threading, tieup: conv.tieup, treadling: conv.treadling,
-  };
-  const newCloth = computeClothOf(trial);
-  let diffCount = 0;
-  const diffCells = [];
-  for (let i = 0; i < curCloth.length; i++) {
-    if (curCloth[i] !== newCloth[i]) {
-      diffCount++;
-      if (diffCells.length < 600) diffCells.push(i);
-    }
-  }
-  conv.diffCount = diffCount;
-  conv.diffCells = diffCells;
-  conv.overLimit = conv.T > state.T;
-  pendingSwitch = { target, conv };
-  showSwitchPreview(conv);
+  openSolverModal();
 }
 
-/* 模式切换预览模态 */
-function showSwitchPreview(conv) {
-  const body = document.createElement("div");
-  const over = conv.overLimit, diff = conv.diffCount > 0;
-  const statCls = over || diff ? "bad" : "ok";
-  let html = `<p style="margin:0 0 6px">按各纬综框组合归并踏板，预览切回<b>踏板组织图</b>后的结果
-      （当前为${state.shed === "rising" ? "提综" : "沉综"}逻辑）：</p>
-    <div class="conv-summary">
-      <span class="conv-stat ${statCls}">所需踏板 <b>${conv.T}</b> 片（设定 ${state.T}）</span>
-      <span class="conv-stat ${diff ? "bad" : "ok"}">成布差异 <b>${conv.diffCount}</b> 格</span>
-      <span class="conv-stat">漏织纬 <b>${conv.deadPicks.length}</b> 纬（不踩踏板）</span>
-    </div>`;
-  if (over)
-    html += `<div class="conv-warn">所需踏板 ${conv.T} 片超过当前预算 ${state.T}。
-      可直接「增至 ${conv.T} 片并采用」（原直提稿进入撤销栈，可用 Ctrl+Z 找回），
-      也可先在设置条调整「踏板预算」或精简升综计划。</div>`;
-  if (diff)
-    html += `<div class="conv-warn">转换稿与当前成布有 ${conv.diffCount} 格不一致，无法保持成布一致，不能覆盖原稿。</div>`;
-  body.innerHTML = html;
+function openSolverModal() {
+  const retained = retainedTreadleInfo();
+  solverUI = {
+    budget: clamp(state.T | 0, 1, 32),
+    K: clamp(solverPrefs.K || 2, 1, 32),
+    lock: !!solverPrefs.lock && retained.has,
+    retained,
+    result: null,
+    sel: 0,
+    solveTimer: null,
+  };
+  renderSolverShell("复合踏板求解 · 直提稿切回踏板");
+  scheduleSolve();
+}
 
-  // 小预览：连结、踏序、成布差异（T=0 时跳过前两块）
-  const blocks = document.createElement("div");
-  blocks.className = "conv-blocks";
-  if (conv.T > 0) {
-    blocks.appendChild(renderConvBlock("新踏板连结（行=综，列=踏）", conv.tieup, state.S, conv.T,
-      (r, c) => conv.tieup.has(key(r, c)), "#8a5a2b"));
-    blocks.appendChild(renderConvBlock("新踏序（上=最新纬，列=踏）", conv.treadling, state.P, conv.T,
-      (r, c) => conv.treadling.has(key(state.P - 1 - r, c)), "#2456a6"));
+function renderSolverShell(title) {
+  const ui = solverUI;
+  const body = document.createElement("div");
+  const lockable = ui.retained.has;
+  body.innerHTML = `
+    <div class="solve-params">
+      <label>踏板预算 <input type="number" min="1" max="32" id="solveBudget" value="${ui.budget}">
+        <small>含固定列</small></label>
+      <label>每纬最多同踩 <input type="number" min="1" max="32" id="solveK" value="${ui.K}"> 片</label>
+      <label class="ck"><input type="checkbox" id="solveLock" ${ui.lock ? "checked" : ""}
+        ${lockable ? "" : "disabled"}>
+        锁定已有连结列${lockable ? `（${ui.retained.n} 列作为固定条件，只能在其后增补）` : "（当前直提稿无保留踏板稿）"}</label>
+      <button id="solveRun">重新求解</button>
+      <span id="solveStatus" class="small muted"></span>
+    </div>
+    <div id="solveResult" class="solve-result"></div>`;
+  const foot = [
+    { label: "放入沙盒手调", primary: true, action: () => openSandbox() },
+    { label: "取消（直提稿保持不变）", action: () => { solverUI = null; closeModal(); } },
+  ];
+  openModal(title, body, foot, true);
+  $("#modalBox").classList.add("xwide");
+  $("#modalFoot").querySelectorAll("button")[0].id = "btnOpenSandbox";
+
+  const arm = () => {
+    ui.budget = clamp(+$("#solveBudget").value || 1, 1, 32);
+    ui.K = clamp(+$("#solveK").value || 1, 1, 32);
+    ui.lock = $("#solveLock").checked;
+    solverPrefs.K = ui.K;
+    solverPrefs.lock = ui.lock;
+    saveSolverPrefs();
+  };
+  for (const id of ["solveBudget", "solveK"])
+    $(("#" + id)).addEventListener("change", () => { arm(); scheduleSolve(); });
+  $("#solveLock").addEventListener("change", () => { arm(); scheduleSolve(); });
+  $("#solveRun").addEventListener("click", () => { arm(); scheduleSolve(); });
+}
+
+function scheduleSolve() {
+  const ui = solverUI;
+  if (!ui) return;
+  clearTimeout(ui.solveTimer);
+  $("#solveStatus").textContent = "求解中…";
+  ui.solveTimer = setTimeout(() => {
+    const r = solveCompound(ui.budget, ui.K, ui.lock);
+    ui.result = r;
+    ui.sel = 0;
+    renderSolveResult();
+  }, 30);
+}
+
+function renderSolveResult() {
+  const ui = solverUI;
+  const box = $("#solveResult");
+  if (!box) return;
+  const r = ui.result;
+  if (!r) return;
+  box.innerHTML = "";
+
+  if (!r.ok) {
+    $("#solveStatus").textContent = "限制内无解，直提稿未改动";
+    box.appendChild(renderFailure(r.fail));
+    const sbBtn = $("#btnOpenSandbox");
+    if (sbBtn) sbBtn.disabled = true;
+    // 放宽预算按钮：锁定列超限→放到固定列数；预算不足→放到“不同开口数”（一纬一踏总够）
+    const foot = $("#modalFoot");
+    if (!foot.querySelector("#solveRelax")) {
+      const b = document.createElement("button");
+      b.id = "solveRelax";
+      b.textContent = r.fail.reason === "lockover"
+        ? `预算增至 ${r.fail.nLock} 后重解`
+        : "放宽预算/同踩上限";
+      b.addEventListener("click", () => {
+        const { tieMasks, dead } = solverTargets();
+        const distinct = new Set();
+        for (let p = 0; p < state.P; p++) if (!dead[p]) distinct.add(tieMasks[p]);
+        if (r.fail.reason === "lockover") ui.budget = r.fail.nLock;
+        else {
+          ui.budget = Math.max(ui.budget, distinct.size, (solverUI.lock ? retainedTreadleInfo().n : 0) + 1);
+          ui.K = Math.max(ui.K, 4);
+        }
+        solverPrefs.K = ui.K;
+        saveSolverPrefs();
+        $("#solveBudget").value = ui.budget;
+        $("#solveK").value = ui.K;
+        scheduleSolve();
+      });
+      foot.insertBefore(b, foot.firstChild);
+    }
+    $("#solveRelax").hidden = r.fail.reason === "alldead";
+    return;
   }
-  // 成布差异小图
+  const relaxBtn = $("#solveRelax");
+  if (relaxBtn) relaxBtn.hidden = true;
+  $("#solveStatus").innerHTML =
+    `找到 <b>${r.sols.length}</b> 个零差异候选（按踏板数 → 最大同踩 → 换脚次数排序）` +
+    (r.capped ? " · 搜索达上限，已给出当前最优候选" : "");
+  const sbBtn = $("#btnOpenSandbox");
+  if (sbBtn) sbBtn.disabled = false;
+
+  const list = document.createElement("div");
+  list.className = "sol-list";
+  r.sols.forEach((sol, i) => list.appendChild(renderSolCard(sol, i)));
+  list.addEventListener("click", (ev) => {
+    const card = ev.target.closest(".sol-card");
+    if (!card) return;
+    ui.sel = +card.dataset.i;
+    list.querySelectorAll(".sol-card").forEach((c) =>
+      c.classList.toggle("sel", +c.dataset.i === ui.sel));
+  });
+  box.appendChild(list);
+}
+
+/* 单个候选卡片：连结 / 复合踏序 / 成布差异 / 逐纬脚法 四块并排 */
+function renderSolCard(sol, i) {
+  const ui = solverUI;
+  const card = document.createElement("div");
+  card.className = "sol-card" + (i === ui.sel ? " sel" : "");
+  card.dataset.i = i;
+  const lockTxt = sol.lockCount ? `含 ${sol.lockCount} 列固定 · ` : "";
+  card.innerHTML = `
+    <div class="sol-head">
+      <b>候选 ${i + 1}</b>
+      <span class="sol-stat">${lockTxt}踏板 <b>${sol.planT}</b> 片（预算 ${ui.budget}，实踩 ${sol.usedCount}）</span>
+      <span class="sol-stat">最大同踩 <b>${sol.maxPress}</b>（限 ${ui.K}）</span>
+      <span class="sol-stat">相邻纬换脚 <b>${sol.foot}</b> 次</span>
+      <span class="sol-stat ok">成布差异 <b>${sol.diff}</b></span>
+    </div>`;
+  const blocks = document.createElement("div");
+  blocks.className = "conv-blocks sol-blocks";
+  blocks.appendChild(renderConvBlock("踏板连结（行=综，列=踏）", sol.tieup, state.S, sol.planT,
+    (r, c) => sol.tieup.has(key(r, c)), "#8a5a2b"));
+  blocks.appendChild(renderConvBlock("复合踏序（上=最新纬，列=踏）", sol.treadling, state.P, sol.planT,
+    (r, c) => sol.treadling.has(key(state.P - 1 - r, c)), "#2456a6"));
   const cur = computeClothOf(state);
   const trial = {
-    S: state.S, T: conv.T, E: state.E, P: state.P, shed: state.shed, mode: "treadle",
-    threading: state.threading, tieup: conv.tieup, treadling: conv.treadling,
+    S: state.S, T: sol.planT, E: state.E, P: state.P, shed: state.shed, mode: "treadle",
+    threading: state.threading, tieup: sol.tieup, treadling: sol.treadling,
   };
-  const nv = computeClothOf(trial);
-  blocks.appendChild(clothDiffMiniSvg(cur, nv));
-  body.appendChild(blocks);
+  blocks.appendChild(clothDiffMiniSvg(cur, computeClothOf(trial)));
+  blocks.appendChild(renderFootworkBlock(sol));
+  card.appendChild(blocks);
+  return card;
+}
 
-  const canApply = !over && !diff && conv.T > 0;
-  const buttons = [{ label: "取消", action: () => { pendingSwitch = null; closeModal(); } }];
-  if (conv.T === 0) {
-    // 每一纬都是漏织哨兵：没有任何有效开口，无法归并出踏板
-    buttons.push({ label: "全部纬均漏织，无法转换", disabled: true,
-                   title: "请先在升综计划中至少画出一纬开口" });
-  } else if (over && !diff) {
-    // 仅踏板数不足：允许直接把预算提高到所需数量后采用（原稿仍保留在撤销栈中）
-    buttons.push({
-      label: `增至 ${conv.T} 片并采用`,
-      primary: true,
-      action: () => applySwitchToTreadle(conv.T),
-    });
-    buttons.push({
-      label: "仅把预算改为 " + conv.T,
-      action: () => {
-        state.T = conv.T;
-        $("#treadles").value = conv.T;
-        pendingSwitch = null;
-        closeModal();
-        pushHistory();
-        toast(`踏板预算已改为 ${conv.T}，可重新切回预览`);
-      },
-    });
-  } else {
-    buttons.push({
-      label: canApply ? "采用并切换" : "成布不一致，不能覆盖原稿",
-      primary: canApply,
-      action: () => { if (canApply) applySwitchToTreadle(); },
-    });
+/* 逐纬脚法：自最新纬向下，标出每纬所踩踏板与相对上一纬的换脚数 */
+function renderFootworkBlock(sol) {
+  const wrap = document.createElement("div");
+  wrap.className = "conv-block fw-block";
+  let s = `<div class="cb-title">逐纬脚法（数字=踏板号）</div><div class="fw-list">`;
+  const { dead } = solverTargets();
+  for (let p = state.P - 1; p >= 0; p--) {
+    const cur = sol.press[p] || [];
+    let chg = "", cls = "";
+    if (p < state.P - 1) {
+      const prev = sol.press[p + 1] || [];
+      const n = footChange(prev, cur);
+      if (n > 0) { chg = `换脚 ${n}`; cls = " chg"; }
+    }
+    const feet = dead[p]
+      ? `<span class="fw-dead">漏织·不踩</span>`
+      : cur.length ? cur.map((t) => `<i>${t + 1}</i>`).join("") : `<span class="fw-dead">—</span>`;
+    s += `<div class="fw-row${cls}"><span class="fw-p">纬${p + 1}</span><span class="fw-feet">${feet}</span><span class="fw-chg">${chg}</span></div>`;
   }
-  openModal("切回踏板组织图 · 转换预览", body, buttons, true);
-  // 成布真的不一致且非踏板数问题时，末位按钮在上面已置为禁用文案
+  s += `</div>`;
+  wrap.innerHTML = s;
+  return wrap;
+}
+function footChange(a, b) {
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let m = 0;
+  for (const t of a) m ^= 1 << t;
+  for (const t of b) m ^= 1 << t;
+  return popcount32(m);
 }
 
 /* 小网格预览（通用黑白/单色点） */
@@ -1971,15 +2488,243 @@ function clothDiffMiniSvg(cur, nv) {
   return wrap;
 }
 
-function applySwitchToTreadle(newT) {
-  if (!pendingSwitch) return;
-  const conv = pendingSwitch.conv;
-  state.tieup = conv.tieup;
-  state.treadling = conv.treadling;
-  // 归并后的实际踏板数；用户选择“增至所需”时可把预算一并提高
-  state.T = Math.max(conv.T, newT || 0);
+/* 无解说明：列出无法还原的纬次与目标开口 */
+function renderFailure(fail) {
+  const wrap = document.createElement("div");
+  let budgetHint;
+  if (fail.reason === "alldead") {
+    budgetHint = `<div class="conv-warn">每一纬都是漏织哨兵，没有任何有效开口，无法归并出踏板。
+      请先在升综计划中至少画出一纬开口，直提稿保持不变。</div>`;
+  } else if (fail.reason === "lockover") {
+    budgetHint = `<div class="conv-warn">固定列已有 ${fail.nLock} 片，超过踏板预算 ${fail.budget}。
+       请提高预算（不能删除固定列），或取消锁定后重解。</div>`;
+  } else {
+    budgetHint = `<div class="conv-warn">在踏板预算 ${fail.budget} 片${fail.nLock ? `（含 ${fail.nLock} 列固定）` : ""}、
+       每纬最多同踩的限制内，以下纬的目标开口无法用踏板连结并集还原。
+       直提稿保持不变，可放宽预算/同踩上限后重新求解。</div>`;
+  }
+  let rows = "";
+  const groups = fail.groups || [];
+  const shown = groups.slice(0, 60);
+  for (const g of shown) {
+    const shafts = bitsOf32(g.up).map((s) => s + 1);
+    const pickTxt = g.picks.slice(0, 24).map((p) => p + 1).join("、") +
+      (g.picks.length > 24 ? ` 等 ${g.picks.length} 纬` : "");
+    rows += `<div class="fail-row">
+      <span class="fail-picks">第 ${pickTxt} 纬</span>
+      <span class="fail-open">目标升综：${shafts.length ? shafts.join("、") : "无（全沉纬，整纬纬浮）"}</span>
+    </div>`;
+  }
+  if (fail.reason !== "alldead" && !shown.length)
+    rows = `<p class="muted">（搜索到达上限仍未构造出完整方案，请放宽预算或同踩上限后重试）</p>`;
+  const total = groups.reduce((n, g) => n + g.picks.length, 0);
+  wrap.innerHTML = budgetHint +
+    (total ? `<div class="fail-summary">共 ${total} 纬无法还原</div>` : "") +
+    rows;
+  return wrap;
+}
+
+/* ---------------- 沙盒手调 ---------------- */
+const sb = { tieup: null, treadling: null, T: 0, lockCount: 0, K: 0, budget: 0, sol: null };
+
+function openSandbox() {
+  const ui = solverUI;
+  if (!ui.result || !ui.result.ok) return;
+  const sol = ui.result.sols[ui.sel];
+  sb.tieup = new Set(sol.tieup);
+  sb.treadling = new Set(sol.treadling);
+  sb.T = sol.planT;
+  sb.lockCount = sol.lockCount;
+  sb.K = ui.K;
+  sb.budget = ui.budget;
+  sb.sol = sol;
+  renderSandbox();
+}
+
+function renderSandbox() {
+  const body = document.createElement("div");
+  const px = 15;
+  body.innerHTML = `
+    <div class="sb-bar" id="sbBar"></div>
+    <div class="sb-boards">
+      <div class="sb-board">
+        <div class="cb-title">踏板连结${sb.lockCount ? `（前 ${sb.lockCount} 列为锁定列，不可改）` : ""}</div>
+        <div class="sb-grid-wrap">${sbColHead(sb.T, px)}<div class="sb-grid" id="sbTieup"
+          style="--sb:${px}px;grid-template-columns:repeat(${sb.T},${px}px)"></div></div>
+      </div>
+      <div class="sb-board">
+        <div class="cb-title">复合踏序（上=最新纬，点击格点踩/放）</div>
+        <div class="sb-grid-wrap">${sbColHead(sb.T, px)}<div class="sb-grid" id="sbTreadling"
+          style="--sb:${px}px;grid-template-columns:repeat(${sb.T},${px}px)"></div></div>
+      </div>
+      <div class="sb-board" id="sbDiff"></div>
+    </div>`;
+  $("#modalTitle").textContent = "复合踏板 · 沙盒手调（零差异才能采用）";
+  const b = $("#modalBody");
+  b.innerHTML = "";
+  b.appendChild(body);
+
+  buildSbGrid("sbTieup", state.S, sb.T, px, (r, c) => sb.tieup.has(key(r, c)),
+    (r, c) => c < sb.lockCount);
+  buildSbGrid("sbTreadling", state.P, sb.T, px,
+    (r, c) => sb.treadling.has(key(state.P - 1 - r, c)), () => false);
+
+  $("#sbTieup").addEventListener("click", (ev) => {
+    const d = ev.target.closest(".sb-cell");
+    if (!d || +d.dataset.c < sb.lockCount) return;
+    const k = key(+d.dataset.r, +d.dataset.c);
+    sb.tieup.has(k) ? sb.tieup.delete(k) : sb.tieup.add(k);
+    refreshSandbox();
+  });
+  $("#sbTreadling").addEventListener("click", (ev) => {
+    const d = ev.target.closest(".sb-cell");
+    if (!d) return;
+    const p = state.P - 1 - (+d.dataset.r);
+    const k = key(p, +d.dataset.c);
+    sb.treadling.has(k) ? sb.treadling.delete(k) : sb.treadling.add(k);
+    refreshSandbox();
+  });
+
+  $("#modalFoot").innerHTML = "";
+  const mk = (label, fn, primary) => {
+    const x = document.createElement("button");
+    x.textContent = label;
+    if (primary) x.className = "primary";
+    x.addEventListener("click", fn);
+    $("#modalFoot").appendChild(x);
+    return x;
+  };
+  const adoptBtn = mk("采用此稿并切回踏板", adoptSandbox, true);
+  adoptBtn.id = "sbAdopt";
+  mk("恢复候选初始", () => openSandbox());
+  mk("返回候选列表", () => {
+    renderSolverShell("复合踏板求解 · 直提稿切回踏板");
+    renderSolveResult();
+  });
+  mk("取消（直提稿保持不变）", () => { solverUI = null; closeModal(); });
+
+  refreshSandbox();
+}
+
+function sbColHead(T, px) {
+  let s = `<div class="sb-colhead" style="grid-template-columns:repeat(${T},${px}px)">`;
+  for (let t = 0; t < T; t++)
+    s += `<div class="sb-hnum${t < sb.lockCount ? " lock" : ""}" title="${t < sb.lockCount ? "锁定列" : ""}">${t + 1}</div>`;
+  return s + `</div>`;
+}
+
+function buildSbGrid(id, rows, cols, px, has, isLock) {
+  const el = document.getElementById(id);
+  const frag = document.createDocumentFragment();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const d = document.createElement("div");
+      d.className = "sb-cell" + (has(r, c) ? " mark" : "") + (isLock(r, c) ? " lock" : "");
+      d.dataset.r = r;
+      d.dataset.c = c;
+      if ((r + 1) % 5 === 0) d.style.borderTopColor = "#c9c3b4";
+      if ((c + 1) % 5 === 0) d.style.borderLeftColor = "#c9c3b4";
+      frag.appendChild(d);
+    }
+  }
+  el.appendChild(frag);
+}
+
+/* 每次格点改动立即重算：差异格、出错格点、最大同踩、换脚次数 */
+function refreshSandbox() {
+  const { tieMasks, dead } = solverTargets();
+  // 列掩码
+  const colMask = new Array(sb.T).fill(0);
+  for (let t = 0; t < sb.T; t++) {
+    let m = 0;
+    for (let s = 0; s < state.S; s++) if (sb.tieup.has(key(s, t))) m |= (1 << s) >>> 0;
+    colMask[t] = m >>> 0;
+  }
+  const press = [];
+  let maxPress = 0, foot = 0, wrongPicks = 0;
+  const badTie = new Set();   // "s:t" 造成错误开口的连结格
+  const badRows = new Set();  // 踏序错误行（数据行号 p）
+  for (let p = 0; p < state.P; p++) {
+    const ps = [];
+    for (let t = 0; t < sb.T; t++) if (sb.treadling.has(key(p, t))) ps.push(t);
+    press.push(ps);
+    maxPress = Math.max(maxPress, ps.length);
+    let union = 0;
+    for (const t of ps) union |= colMask[t];
+    union >>>= 0;
+    let ok;
+    if (dead[p]) ok = ps.length === 0;
+    else ok = ps.length > 0 && union === tieMasks[p];
+    if (!ok) {
+      wrongPicks++;
+      badRows.add(p);
+      const diffShafts = dead[p] ? union : (union ^ tieMasks[p]) >>> 0;
+      for (const t of ps)
+        for (let s = 0; s < state.S; s++)
+          if ((diffShafts >>> s) & 1) badTie.add(key(s, t));
+    }
+  }
+  for (let p = 1; p < state.P; p++) foot += footChange(press[p - 1], press[p]);
+
+  // 格点重绘（标记态 + 错误态）
+  const tieEl = document.getElementById("sbTieup");
+  const trEl = document.getElementById("sbTreadling");
+  for (let s = 0; s < state.S; s++) {
+    for (let t = 0; t < sb.T; t++) {
+      const cell = tieEl.children[s * sb.T + t];
+      cell.classList.toggle("mark", sb.tieup.has(key(s, t)));
+      cell.classList.toggle("bad", badTie.has(key(s, t)));
+    }
+  }
+  for (let r = 0; r < state.P; r++) {
+    const p = state.P - 1 - r;
+    for (let t = 0; t < sb.T; t++) {
+      const cell = trEl.children[r * sb.T + t];
+      cell.classList.toggle("mark", sb.treadling.has(key(p, t)));
+      cell.classList.toggle("rowbad", badRows.has(p));
+    }
+  }
+
+  // 成布差异
+  const trial = {
+    S: state.S, T: sb.T, E: state.E, P: state.P, shed: state.shed, mode: "treadle",
+    threading: state.threading, tieup: sb.tieup, treadling: sb.treadling,
+  };
+  const curCloth = computeClothOf(state);
+  const newCloth = computeClothOf(trial);
+  let diff = 0;
+  for (let i = 0; i < curCloth.length; i++) if (curCloth[i] !== newCloth[i]) diff++;
+  const diffBox = document.getElementById("sbDiff");
+  diffBox.innerHTML = "";
+  const diffWrap = clothDiffMiniSvg(curCloth, newCloth);
+  diffWrap.querySelector(".cb-title").textContent =
+    `成布差异（红消失/绿新增，当前 ${diff} 格不同）`;
+  diffBox.appendChild(diffWrap);
+
+  // 状态条
+  const bar = document.getElementById("sbBar");
+  const items = [];
+  items.push(diff === 0
+    ? `<span class="sb-badge ok">成布差异 0 · 可采用</span>`
+    : `<span class="sb-badge bad">成布差异 ${diff} 格 · ${wrongPicks} 纬开口不符</span>`);
+  items.push(`<span class="sb-badge">踏板 ${sb.T} 片（预算 ${sb.budget}）</span>`);
+  items.push(maxPress > sb.K
+    ? `<span class="sb-badge warn">最大同踩 ${maxPress} 片，超出设定 ${sb.K}（仍可零差异采用）</span>`
+    : `<span class="sb-badge">最大同踩 ${maxPress} 片（限 ${sb.K}）</span>`);
+  items.push(`<span class="sb-badge">相邻纬换脚 ${foot} 次</span>`);
+  bar.innerHTML = items.join("");
+  const adopt = document.getElementById("sbAdopt");
+  if (adopt) adopt.disabled = diff !== 0;
+}
+
+function adoptSandbox() {
+  const T = sb.T;
+  const tieup = new Set(sb.tieup), treadling = new Set(sb.treadling);
+  solverUI = null;
+  state.tieup = tieup;
+  state.treadling = treadling;
+  state.T = T;
   state.mode = "treadle";
-  pendingSwitch = null;
   stopPlay(); play.pick = -1;
   cancelSelection(true);
   closeModal();
@@ -1987,7 +2732,7 @@ function applySwitchToTreadle(newT) {
   applyModeUI();
   rebuildAll();
   pushHistory();
-  toast(`已切回踏板模式：${conv.T} 片踏板，成布保持一致`);
+  toast(`已采用复合踏板方案：${T} 片踏板，成布与直提稿一致`);
 }
 
 /* ============================================================
@@ -2571,6 +3316,7 @@ function openModal(title, bodyNode, buttons, wide) {
     foot.appendChild(bEl);
   }
   $("#modalBox").classList.toggle("wide", !!wide);
+  $("#modalBox").classList.remove("xwide");
   $("#modalMask").hidden = false;
 }
 function closeModal() { $("#modalMask").hidden = true; }
