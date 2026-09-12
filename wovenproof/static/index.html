@@ -136,6 +136,7 @@
     <nav class="tabs">
       <button data-tab="issues" class="active">问题校对</button>
       <button data-tab="variant">变体</button>
+      <button data-tab="repeat">循环校验</button>
       <button data-tab="colors">色纱</button>
       <button data-tab="help">帮助</button>
     </nav>
@@ -166,6 +167,66 @@
       <div class="variant-actions" id="variantActions" hidden>
         <button id="variantApply" class="primary">采用变体（替换当前）</button>
         <button id="variantCancel">放弃</button>
+      </div>
+    </div>
+
+    <div class="tab-pane" id="paneRepeat">
+      <div class="rule-box">
+        <div class="rule-title">循环单元拼接校验</div>
+        <div class="rep-actions">
+          <button id="repFind" title="自动查找能完整复现当前穿综与踏序/升综计划的经纬周期">查找周期</button>
+          <button id="repApplyFind" class="primary" hidden>采用查到的周期</button>
+        </div>
+        <div class="rep-found muted small" id="repFound">尚未查找。穿综周期看经向，踏序/升综计划周期看纬向。</div>
+        <hr>
+        <div class="rep-manual">
+          <div class="rep-manual-row">
+            <b>经向（穿综）</b>
+            <label>长度 <input id="repWarpLen" type="number" min="1" max="600" value="4"></label>
+            <label>起点 <input id="repWarpStart" type="number" min="1" max="600" value="1"></label>
+          </div>
+          <div class="rep-manual-row">
+            <b>纬向（踏序/升综）</b>
+            <label>长度 <input id="repWeftLen" type="number" min="1" max="600" value="4"></label>
+            <label>起点 <input id="repWeftStart" type="number" min="1" max="600" value="1"></label>
+          </div>
+          <div class="rep-manual-row">
+            <button id="repCheck" class="primary">校验该单元</button>
+            <span class="small muted">起点按 1 起计；长度×起点组成一个候选循环单元。</span>
+          </div>
+        </div>
+      </div>
+      <div class="rep-status" id="repStatus" hidden></div>
+      <div class="rep-diff-wrap" id="repDiffWrap" hidden>
+        <div class="rep-diff-title">平铺差异（红=原稿格，绿=单元平铺格，黄=两者皆空以外的不一致）</div>
+        <div class="rep-diff-scroll" id="repDiffScroll"></div>
+        <div class="rep-diff-summary" id="repDiffSummary"></div>
+      </div>
+      <div class="rep-preview" id="repPreview" hidden>
+        <div class="rep-preview-head">
+          <b>3×3 平铺预演</b>
+          <span class="small muted">中心粗框=循环单元；四边红虚线=接缝；边缘色条=色纱相位</span>
+        </div>
+        <div class="rep-tile-scroll" id="repTileScroll"></div>
+        <div class="rep-seam-report" id="repSeamReport"></div>
+      </div>
+      <div class="rep-rotate" id="repRotate" hidden>
+        <div class="rule-title">旋转循环起点（预演后确认）</div>
+        <div class="rep-rot-row">
+          <b>经向起点</b>
+          <button id="rotWarpDec" title="经向起点左移 1">−1</button>
+          <span id="rotWarpVal" class="rep-rot-val">0</span>
+          <button id="rotWarpInc" title="经向起点右移 1">＋1</button>
+          <b>纬向起点</b>
+          <button id="rotWeftDec" title="纬向起点下移 1">−1</button>
+          <span id="rotWeftVal" class="rep-rot-val">0</span>
+          <button id="rotWeftInc" title="纬向起点上移 1">＋1</button>
+          <button id="rotReset" title="回到未旋转">复位</button>
+        </div>
+        <div class="rep-rot-preview" id="rotPreview"></div>
+        <div class="rep-rot-actions">
+          <button id="rotApply" class="primary" disabled>采用旋转结果（写入原稿）</button>
+        </div>
       </div>
     </div>
 
@@ -222,6 +283,13 @@
           <li>选区模式下拖出矩形，可复制、剪切、循环扩展到末端；复制后切换点涂，单击目标格粘贴。</li>
           <li>Ctrl+Z / Ctrl+Y 撤销重做；Ctrl+D 取消选择。</li>
           <li>问题列表中的条目与三个输入格、成布格可互相点击定位。</li>
+        </ul>
+        <h3>循环单元拼接校验</h3>
+        <ul>
+          <li>「循环校验」页可<b>查找周期</b>（自动找出能完整复现当前穿综、踏序或 LIFTPLAN 的经纬周期），也可手动输入长度与起点后<b>校验该单元</b>。</li>
+          <li>单元若不能平铺还原原稿，会逐格显示差异（红=原稿、绿=平铺），并<b>不</b>标为有效循环。</li>
+          <li>有效单元给出 3×3 成布预演：粗框为中心单元，四边红虚线为接缝，边缘色条为色纱相位；浮长与边经交织按<b>首尾相接</b>（跨周期）计算，整行/整列跨周期连续会单独提示，点击问题可同时定位原稿两端。</li>
+          <li>经向、纬向起点都可 ±1 旋转并即时对比接缝与颜色变化；预演穿综、踏序/升综计划与经纬色序的改动，确认「采用旋转结果」后写入原稿，并同步到撤销记录、本地草稿、版本、逐纬播放、WIF 与打印图。</li>
         </ul>
         <h3>WIF</h3>
         <p class="small">支持导入/导出标准 WIF：THREADING/TIEUP/TREADLING 或 LIFTPLAN、WARP/WEFT COLORS、SHED。
