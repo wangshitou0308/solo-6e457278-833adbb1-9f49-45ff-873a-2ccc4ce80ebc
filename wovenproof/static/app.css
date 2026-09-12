@@ -116,11 +116,13 @@ input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allow
 }
 .board-legend b { color: var(--accent); }
 
-/* 扁平四宫格：3 列（尺宽 | 连结/踏序/升综计划 | 穿综/成布）× 4 行 */
+/* 扁平四宫格：3 列（尺宽 | 连结/踏序/升综计划 | 穿综/成布）× 4 行。
+   首尾说明行用 auto：综框数很少（如 2 综）时格高不足一行，
+   让角格里的开口提示自动撑高而不是压住下面的网格/标尺。 */
 .board {
   display: grid;
   grid-template-columns: var(--ruler) calc(var(--M, var(--T, 4)) * var(--cell)) calc(var(--E, 24) * var(--cell));
-  grid-template-rows: var(--cell) calc(var(--S, 4) * var(--cell)) var(--cell) calc(var(--P, 24) * var(--cell));
+  grid-template-rows: auto calc(var(--S, 4) * var(--cell)) auto calc(var(--P, 24) * var(--cell));
   column-gap: 6px;
   row-gap: 4px;
   width: max-content;
@@ -133,11 +135,12 @@ input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allow
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 1px;
-  padding: 0 4px;
+  gap: 2px;
+  padding: 2px 4px;
+  min-height: calc(var(--cell) + 6px);
 }
 .corner-title { font-weight: 700; font-size: 12px; color: var(--accent); }
-.corner-shed { font-size: 10px; color: var(--muted); }
+.corner-shed { font-size: 10px; color: var(--muted); line-height: 1.35; }
 .ruler-corner-blank { grid-column: 1; grid-row: 3; }
 .ruler-corner-br {
   grid-column: 3; grid-row: 3;
@@ -151,6 +154,7 @@ input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allow
   grid-auto-flow: column;
   grid-auto-columns: var(--cell);
   grid-template-rows: var(--cell);
+  align-self: end;   /* auto 行内贴住下方网格，避免角格撑高时与格错位 */
 }
 .ruler-top.ends { grid-column: 3; grid-row: 1; }
 .ruler-bottom { grid-column: 2; grid-row: 3; }
@@ -238,6 +242,7 @@ input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allow
 .cell.play-shaft { background: #d9a767 !important; box-shadow: inset 0 0 0 2px var(--accent); }
 .grid.treadling .cell.play-treadle { background: #7ea4dd !important; box-shadow: inset 0 0 0 2px var(--blue); }
 .grid.liftplan .cell.play-shaft { background: #7fc79b !important; box-shadow: inset 0 0 0 2px var(--green); }
+.grid.liftplan .cell.play-alldown { outline: 2px dashed var(--green); outline-offset: -2px; background: #e7f4ec; }
 
 /* 选区矩形 */
 .sel-rect {

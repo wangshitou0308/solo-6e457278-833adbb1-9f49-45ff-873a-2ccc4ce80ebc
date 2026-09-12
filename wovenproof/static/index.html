@@ -34,7 +34,7 @@
 
 <section class="setupbar">
   <label>综框 <input id="shafts" type="number" min="2" max="32" value="4"></label>
-  <label>踏板 <input id="treadles" type="number" min="1" max="32" value="4"></label>
+  <label><span id="treadlesLabel">踏板</span> <input id="treadles" type="number" min="1" max="32" value="4" title="踏板组织图模式下的踏板数；直提模式下作为切回踏板时的数量预算"></label>
   <label>经纱数 <input id="ends" type="number" min="1" max="600" value="24"></label>
   <label>纬纱数 <input id="picks" type="number" min="1" max="600" value="24"></label>
   <label>开口逻辑
@@ -204,10 +204,10 @@
         <ul>
           <li>顶部可在<b>踏板组织图</b>（连结+踏序）与<b>直提升综 LIFTPLAN</b>（纬次×综框）间切换。</li>
           <li>升综计划里标记每纬<b>升起</b>的综框（与开口逻辑无关，遵循 WIF LIFTPLAN 约定）；未标综沉下，同样支持点涂/拖涂/擦除/选区与撤销重做。</li>
+          <li>一纬什么都不标是有效的<b>全沉纬</b>（WIF 的 <code>pick=0</code>，整纬纬纱在上），问题列表会以提示标出；只有从踏板稿转换时遇到的漏织纬才记为无交织（红）。</li>
           <li>切到直提时按现有连结与踏序自动生成 LIFTPLAN（原踏板稿保留，可撤销）；沉综稿下列出的是未连结而升起的综框。</li>
           <li>切回踏板时按各纬升综组合归并踏板（沉综逻辑下连结该纬沉下的综框），<b>先预览</b>新连结、踏序、所需踏板数与成布差异；
-              所需踏板超过设定数量或成布无法保持一致时，不会覆盖原稿。</li>
-          <li>一纬没有任何升综标记视为漏织（成布记无交织）。</li>
+              所需踏板超过预算时可在预览里直接「增至所需并采用」（原稿进撤销栈），成布无法保持一致或全部纬均漏织时则不能覆盖原稿。</li>
         </ul>
         <h3>操作</h3>
         <ul>

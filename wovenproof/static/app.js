@@ -581,18 +581,19 @@ function computeClothFrom(d) {
   if (mode === "lift") {
     // LIFTPLAN 按 WIF 约定始终列出“升起”的综框，与 Shed 无关：
     // 提综开口直接据此判断；沉综开口下列出者同样升起、未列者沉下。
+    // 无任何标记的“全沉纬”是有效开口（整纬纬浮，对应 WIF 的 pick=0）；
+    // 只有内部哨兵 "p:-1"（由踏板稿漏织纬转换而来）才记为无交织。
     const lift = d.liftplan || state.liftplan;
     const dead = new Uint8Array(P);
-    const hasMark = new Uint8Array(P);
     for (const k of lift) {
       const [p, s] = parseKey(k);
       if (p >= P) continue;
       if (s === LIFT_DEAD) dead[p] = 1;
-      else if (s < S) { upByPick[p][s] = 1; hasMark[p] = 1; }
+      else if (s < S) upByPick[p][s] = 1;
     }
     for (let p = 0; p < P; p++) {
-      if (dead[p] || !hasMark[p]) continue; // 漏织哨兵 / 空行：active 保持 0，稍后记 -1
-      active[p] = 1;
+      if (dead[p]) continue; // 漏织哨兵：active 保持 0，稍后记 -1
+      active[p] = 1;         // 全沉纬（无标记）同样开口有效
     }
   } else {
     // 每片综连结了哪些踏板
@@ -607,13 +608,14 @@ function computeClothFrom(d) {
         const [pp, t] = parseKey(k);
         if (pp === p && t < T) pressed.add(t);
       }
-      if (pressed.size === 0) continue; // 整纬无踏板 → -1
+      if (pressed.size === 0) continue; // 该纬漏踩踏板 → -1（用户稿按漏织处理）
       active[p] = 1;
       for (let s = 0; s < S; s++) {
         let linked = treadlesOfShaft[s].some((t) => pressed.has(t));
         if (shed === "sinking") linked = !linked;
         upByPick[p][s] = linked ? 1 : 0;
       }
+      // 注：提综逻辑下踩到全空连结踏板＝有效全沉纬（整纬纬浮），与 LIFTPLAN 空行等价。
     }
   }
 
@@ -627,7 +629,8 @@ function computeClothFrom(d) {
   return { cloth: out, active };
 }
 
-/* 每纬升综签名（数组）：空数组代表漏织纬。供转换/打印周期/播放复用 */
+/* 每纬升综签名（数组）：空数组是有效的“全沉纬”（整纬纬浮），不是漏织。
+   供转换/打印周期/播放复用 */
 function liftSetOfPick(p) {
   const arr = [];
   for (const k of state.liftplan) {
@@ -636,7 +639,31 @@ function liftSetOfPick(p) {
   }
   return arr.sort((a, b) => a - b);
 }
+/* 哨兵纬：由踏板稿漏织纬转换而来，成布记无交织 */
 function isDeadLiftPick(p) { return state.liftplan.has(key(p, LIFT_DEAD)); }
+/* 一次扫描得到每纬状态：dead=哨兵漏织，empty=有效全沉纬（无升综标记） */
+function liftPickStates() {
+  const P = state.P, S = state.S;
+  const dead = new Uint8Array(P), has = new Uint8Array(P);
+  for (const k of state.liftplan) {
+    const [p, s] = parseKey(k);
+    if (p >= P) continue;
+    if (s === LIFT_DEAD) dead[p] = 1;
+    else if (s >= 0 && s < S) has[p] = 1;
+  }
+  const allDown = new Uint8Array(P);
+  for (let p = 0; p < P; p++) if (!dead[p] && !has[p]) allDown[p] = 1;
+  return { dead, allDown };
+}
+/* 有效但全沉的纬（无任何升综标记、且非哨兵） */
+function isAllDownPick(p) {
+  if (isDeadLiftPick(p)) return false;
+  for (const k of state.liftplan) {
+    const [pp, s] = parseKey(k);
+    if (pp === p && s >= 0 && s < state.S) return false;
+  }
+  return true;
+}
 
 /* ============================================================
    成布 SVG 渲染
@@ -824,13 +851,19 @@ function runAnalysis() {
 
   /* ---- 漏织（整纬无开口） ---- */
   const deadPicks = [];
+  const allDownPicks = [];
   if (isLift) {
+    const st = liftPickStates();
     for (let p = 0; p < P; p++) {
-      if (!activeTreadles[p]) {
+      if (st.dead[p]) {
+        // 哨兵纬：真正无开口，整纬无交织
         deadPicks.push(p);
         issueCells.pickRuler.add(p);
         for (let s = 0; s < S; s++) issueCells.liftplan.add(key(p, s));
         for (let e = 0; e < E; e++) issueCells.drawdown.add(key(p, e));
+      } else if (st.allDown[p]) {
+        allDownPicks.push(p);
+        issueCells.pickWarnRuler.add(p);
       }
     }
   } else {
@@ -848,9 +881,16 @@ function runAnalysis() {
     sev: "error", kind: "dead-pick",
     title: `${isLift ? "升综计划漏织纬纱" : "漏织纬纱"} ×${deadPicks.length}`,
     desc: isLift
-      ? "这些纬没有任何升起的综框（整行空白），梭口不开。"
+      ? "这些纬没有开口（由踏板稿的漏织纬保留下来），梭口不开。"
       : "这些纬没有踩任何踏板（或所踩踏板无连结），梭口不开。",
     locs: deadPicks.slice(0, 10).map((p) => ({
+      kind: "dead-pick-loc", pick: p, text: `第 ${p + 1} 纬` })),
+  });
+  if (isLift && allDownPicks.length) issues.push({
+    sev: "info", kind: "all-down-pick",
+    title: `全沉纬 ×${allDownPicks.length}`,
+    desc: "这些纬没有任何综框升起（对应 WIF 的 pick=0）：梭口仍然有效，整纬纬纱在上（纬浮点）。",
+    locs: allDownPicks.slice(0, 10).map((p) => ({
       kind: "dead-pick-loc", pick: p, text: `第 ${p + 1} 纬` })),
   });
 
@@ -963,7 +1003,7 @@ function runAnalysis() {
     sev: "warn", kind: "dead-shaft",
     title: `死综 ×${deadShafts.length}`,
     desc: isLift
-      ? "有经纱穿入，但升综计划中这些综框从未升起（或在沉综逻辑下应改用计划外综框表达）。"
+      ? "有经纱穿入，但升综计划中这些综框从未升起（在提综逻辑下整列恒为纬浮）。"
       : "有经纱穿入但踏板连结里没有连接，踩任何踏板都不会动。",
     locs: deadShafts.map((s) => ({
       kind: isLift ? "liftcol" : "tieup-row", s, text: `综框 ${s + 1}` })),
@@ -975,8 +1015,7 @@ function runAnalysis() {
     for (let t = 0; t < T; t++) {
       if (!treadleUsed[t]) unusedTreadles.push(t);
       if (treadleUsed[t] && !treadleLinked[t]) emptyTreadles.push(t);
-      if (!treadleUsed[t] || (treadleUsed[t] && !treadleLinked[t]))
-        issueCells.treadleRuler.add(t);
+      if (!treadleUsed[t]) issueCells.treadleRuler.add(t);
     }
     if (unusedTreadles.length) issues.push({
       sev: "warn", kind: "unused-treadle",
@@ -985,9 +1024,11 @@ function runAnalysis() {
       locs: unusedTreadles.map((t) => ({ kind: "treadle", t, text: `踏板 ${t + 1}` })),
     });
     if (emptyTreadles.length) issues.push({
-      sev: "error", kind: "empty-treadle",
+      sev: "info", kind: "empty-treadle",
       title: `空连结踏板被使用 ×${emptyTreadles.length}`,
-      desc: "踏序踩了这些踏板，但它们没有连结任何综框，等于空踩。",
+      desc: state.shed === "rising"
+        ? "这些踏板没有连结任何综框：踩下时全部综框沉下，相当于升综计划中的“全沉纬”（pick=0），梭口有效、整纬纬浮。"
+        : "沉综逻辑下这些踏板使所有综框保持升起，整纬经浮。",
       locs: emptyTreadles.map((t) => ({ kind: "treadling-treadle", t, text: `踏板 ${t + 1}` })),
     });
   }
@@ -1104,12 +1145,18 @@ function locateIssue(it, li) {
     case "treadling-pick":
     case "dead-pick-loc": {
       if (state.mode === "lift") {
-        // 直提模式：定位升综计划对应行（从第 1 列开始可见）
+        // 直提模式：定位升综计划对应行（整行闪烁，全沉纬也可见）
         const cols = state.S;
         if (cols > 0) {
-          const idx = domRow("liftplan", loc.pick) * cols;
-          const el = $("#gridLiftplan").children[idx];
-          if (el) { el.classList.add("loc-flash"); scrollToView(el); setTimeout(() => el.classList.remove("loc-flash"), 1800); }
+          const base = domRow("liftplan", loc.pick) * cols;
+          const first = $("#gridLiftplan").children[base];
+          for (let s = 0; s < cols; s++)
+            $("#gridLiftplan").children[base + s].classList.add("loc-flash");
+          if (first) {
+            scrollToView(first);
+            setTimeout(() => $("#gridLiftplan").querySelectorAll(".loc-flash")
+              .forEach((n) => n.classList.remove("loc-flash")), 1800);
+          }
         }
       } else {
         const t = firstTreadleOfPick(loc.pick);
@@ -1273,6 +1320,7 @@ function maybeShowIssueTip(ev, kind, dR, dc) {
       found = found.concat(issues.filter((i) => i.kind === "unused-treadle" || i.kind === "empty-treadle"));
   } else if (kind === "liftplan") {
     if (issueCells.pickRuler.has(dR)) found = issues.filter((i) => i.kind === "dead-pick");
+    else if (issueCells.pickWarnRuler.has(dR)) found = issues.filter((i) => i.kind === "all-down-pick");
     if (issueCells.liftColRuler.has(dc))
       found = found.concat(issues.filter((i) => i.kind === "dead-shaft"));
   }
@@ -1341,7 +1389,8 @@ function onRulerClick(ev) {
   if (kind === "shaft") issue = issues.find((i) => i.kind === "dead-shaft" || i.kind === "unused-shaft");
   if (kind === "liftcol") issue = issues.find((i) => i.kind === "dead-shaft");
   if (kind === "treadle") issue = issues.find((i) => i.kind === "empty-treadle" || i.kind === "unused-treadle");
-  if (kind === "pick") issue = issues.find((i) => i.kind === "dead-pick");
+  if (kind === "pick")
+    issue = issues.find((i) => i.kind === "dead-pick" || i.kind === "all-down-pick");
   if (issue) {
     const li = $$(".issue-item")[issues.indexOf(issue)];
     if (li) { scrollToView(li, { behavior: "smooth", block: "center" }); locateIssue(issue, li); }
@@ -1370,12 +1419,12 @@ function drawPlayOverlay() {
 function upShaftsAtPick(p) {
   const up = new Uint8Array(state.S);
   if (state.mode === "lift") {
-    let has = false;
+    if (state.liftplan.has(key(p, LIFT_DEAD))) return null; // 哨兵漏织纬
     for (const k of state.liftplan) {
       const [pp, s] = parseKey(k);
-      if (pp === p && s >= 0 && s < state.S) { up[s] = 1; has = true; }
+      if (pp === p && s >= 0 && s < state.S) up[s] = 1;
     }
-    if (!has || state.liftplan.has(key(p, LIFT_DEAD))) return null;
+    // 无标记＝有效全沉纬，返回全 0（无综升起）
   } else {
     const pressed = new Set();
     for (const k of state.treadling) {
@@ -1396,8 +1445,8 @@ function upShaftsAtPick(p) {
   return up;
 }
 function applyPlayHighlights() {
-  $$(".cell.play-shaft,.cell.play-treadle").forEach((n) =>
-    n.classList.remove("play-shaft", "play-treadle"));
+  $$(".cell.play-shaft,.cell.play-treadle,.cell.play-alldown").forEach((n) =>
+    n.classList.remove("play-shaft", "play-treadle", "play-alldown"));
   if (play.pick < 0) return;
   const p = play.pick;
 
@@ -1406,10 +1455,18 @@ function applyPlayHighlights() {
     // 高亮升综计划行
     const lp = $("#gridLiftplan");
     const dr = domRow("liftplan", p);
+    let anyUp = false;
     for (const k of state.liftplan) {
       const [pp, s] = parseKey(k);
-      if (pp === p && s >= 0 && s < state.S)
+      if (pp === p && s >= 0 && s < state.S) {
         lp.children[dr * state.S + s].classList.add("play-shaft");
+        anyUp = true;
+      }
+    }
+    // 有效全沉纬：整行描边提示（无综升起但梭口有效）
+    if (up && !anyUp) {
+      for (let s = 0; s < state.S; s++)
+        lp.children[dr * state.S + s].classList.add("play-alldown");
     }
     $$("#shaftRuler .rnum, #liftColRuler .rnum").forEach((rn) => {
       const s = +rn.dataset.idx;
@@ -1536,7 +1593,8 @@ function buildVariant(kind) {
     // 换面：交换提综/沉综逻辑；为保持成布等价，反转“升综表达”
     v.shed = state.shed === "rising" ? "sinking" : "rising";
     if (state.mode === "lift") {
-      // 直提：把每纬升综综框换成其补集（漏织纬保持漏织）
+      // 直提：把每纬升综综框换成其补集（哨兵漏织纬保持漏织）。
+      // 全沉纬（无标记）的补集＝全部综升起，仍是有效开口。
       const lift = new Set();
       const dead = new Uint8Array(state.P);
       for (const k of state.liftplan) {
@@ -1544,13 +1602,12 @@ function buildVariant(kind) {
         if (s === LIFT_DEAD && p < state.P) dead[p] = 1;
       }
       const present = Array.from({ length: state.P }, () => new Uint8Array(state.S));
-      let any = new Uint8Array(state.P);
       for (const k of state.liftplan) {
         const [p, s] = parseKey(k);
-        if (s >= 0 && s < state.S && p < state.P) { present[p][s] = 1; any[p] = 1; }
+        if (s >= 0 && s < state.S && p < state.P) present[p][s] = 1;
       }
       for (let p = 0; p < state.P; p++) {
-        if (!any[p] || dead[p]) { lift.add(key(p, LIFT_DEAD)); continue; }
+        if (dead[p]) { lift.add(key(p, LIFT_DEAD)); continue; }
         for (let s = 0; s < state.S; s++) if (!present[p][s]) lift.add(key(p, s));
       }
       v.liftplan = lift;
@@ -1661,8 +1718,12 @@ function applyModeUI() {
   $("#legendLiftSwatch").hidden = !isLift;
   $("#legendLiftText").hidden = !isLift;
   $("#boardLegendTitle").textContent = isLift ? "直提式四宫格：" : "四宫格：";
-  // 踏板数量只在踏板模式可改
-  $("#treadles").disabled = isLift;
+  // 直提模式下“踏板数”作为切回踏板模式时的预算，仍允许调整
+  $("#treadles").disabled = false;
+  $("#treadlesLabel").textContent = isLift ? "踏板预算" : "踏板";
+  $("#treadles").title = isLift
+    ? "切回踏板模式时允许的最大踏板数（预算）"
+    : "";
   // 顶部模式按钮
   $$("#editMode button").forEach((b) =>
     b.classList.toggle("active", b.dataset.editmode === state.mode));
@@ -1672,7 +1733,7 @@ function applyModeUI() {
 
 /* 踏板稿 → 升综计划：按现有连结 + 踏序逐纬求“升起”的综框。
    LIFTPLAN 按 WIF 约定始终记录升起综框，与 Shed 无关；
-   沉综逻辑下由计算端把未列入的综视为升起（下沉综＝计划中列出者）。 */
+   沉综逻辑下未连结而升起的综框列入计划，连结的综框沉下。 */
 function treadleToLift() {
   const { S, P } = state;
   const lift = new Set();
@@ -1690,6 +1751,20 @@ function treadleToLift() {
       if (pp === p && t < state.T) pressed.add(t);
     }
     if (!pressed.size) { lift.add(key(p, LIFT_DEAD)); dead++; continue; }
+    // 踩下的踏板是否至少有一个带连结：全为空连结踏板时，
+    // 提综逻辑＝全综沉下（有效全沉纬，计划行留空）；
+    // 沉综逻辑＝全综升起（计划列入全部综）。
+    let anyLink = false;
+    for (const t of pressed) {
+      for (let s = 0; s < S; s++) if (state.tieup.has(key(s, t))) { anyLink = true; break; }
+      if (anyLink) break;
+    }
+    if (!anyLink) {
+      if (state.shed === "sinking")
+        for (let s = 0; s < S; s++) lift.add(key(p, s));
+      // rising：不写任何键＝有效全沉纬
+      continue;
+    }
     for (let s = 0; s < S; s++) {
       const linked = treadlesOfShaft[s].some((t) => pressed.has(t));
       // rising: 连结=升起 → 列入计划；sinking: 连结=沉下 → 未连结者升起，列入计划
@@ -1700,8 +1775,10 @@ function treadleToLift() {
   return { lift, dead };
 }
 
-/* 升综计划 → 踏板稿：按综框组合归并踏板（不含漏织纬）。
-   沉综开口下，连结标记表示沉下综框，故 tieup 列该纬“未升起”的综框。
+/* 升综计划 → 踏板稿：按综框组合归并踏板。
+   - 哨兵纬（真正漏织）不踩踏板；
+   - 全沉纬（空签名）归到一个“空连结踏板”，提综逻辑下踩它＝全综沉下；
+   - 沉综开口下，连结标记表示沉下综框，故 tieup 列该纬“未升起”的综框。
    返回 {tieup, treadling, T, deadPicks:[]} */
 function liftToTreadle() {
   const { S, P } = state;
@@ -1718,13 +1795,12 @@ function liftToTreadle() {
   };
   for (let p = 0; p < P; p++) {
     if (isDeadLiftPick(p)) { deadPicks.push(p); continue; }
-    const raised = liftSetOfPick(p);
-    if (!raised.length) { deadPicks.push(p); continue; } // 空行按漏织处理
-    const sig = raised.join(",");
-    let t = groups.get(sig);
+    const raised = liftSetOfPick(p);   // 空数组＝有效全沉纬
+    const sigStr = raised.join(",");   // "" 即空连结踏板
+    let t = groups.get(sigStr);
     if (t === undefined) {
       t = groups.size;
-      groups.set(sig, t);
+      groups.set(sigStr, t);
       for (const s of tieFor(raised)) tieup.add(key(s, t));
     }
     treadling.add(key(p, t));
@@ -1796,19 +1872,22 @@ function showSwitchPreview(conv) {
       <span class="conv-stat">漏织纬 <b>${conv.deadPicks.length}</b> 纬（不踩踏板）</span>
     </div>`;
   if (over)
-    html += `<div class="conv-warn">所需踏板 ${conv.T} 片超过设定数量 ${state.T}。
-      请先在设置条增加踏板数（或精简升综计划），否则不能覆盖原稿。</div>`;
+    html += `<div class="conv-warn">所需踏板 ${conv.T} 片超过当前预算 ${state.T}。
+      可直接「增至 ${conv.T} 片并采用」（原直提稿进入撤销栈，可用 Ctrl+Z 找回），
+      也可先在设置条调整「踏板预算」或精简升综计划。</div>`;
   if (diff)
     html += `<div class="conv-warn">转换稿与当前成布有 ${conv.diffCount} 格不一致，无法保持成布一致，不能覆盖原稿。</div>`;
   body.innerHTML = html;
 
-  // 三块小预览：连结、踏序、成布差异
+  // 小预览：连结、踏序、成布差异（T=0 时跳过前两块）
   const blocks = document.createElement("div");
   blocks.className = "conv-blocks";
-  blocks.appendChild(renderConvBlock("新踏板连结（行=综，列=踏）", conv.tieup, state.S, conv.T,
-    (r, c) => conv.tieup.has(key(r, c)), "#8a5a2b"));
-  blocks.appendChild(renderConvBlock("新踏序（上=最新纬，列=踏）", conv.treadling, state.P, conv.T,
-    (r, c) => conv.treadling.has(key(state.P - 1 - r, c)), "#2456a6"));
+  if (conv.T > 0) {
+    blocks.appendChild(renderConvBlock("新踏板连结（行=综，列=踏）", conv.tieup, state.S, conv.T,
+      (r, c) => conv.tieup.has(key(r, c)), "#8a5a2b"));
+    blocks.appendChild(renderConvBlock("新踏序（上=最新纬，列=踏）", conv.treadling, state.P, conv.T,
+      (r, c) => conv.treadling.has(key(state.P - 1 - r, c)), "#2456a6"));
+  }
   // 成布差异小图
   const cur = computeClothOf(state);
   const trial = {
@@ -1819,20 +1898,39 @@ function showSwitchPreview(conv) {
   blocks.appendChild(clothDiffMiniSvg(cur, nv));
   body.appendChild(blocks);
 
-  const canApply = !over && !diff;
-  openModal("切回踏板组织图 · 转换预览", body, [
-    { label: "取消", action: () => { pendingSwitch = null; closeModal(); } },
-    {
-      label: canApply ? "采用并切换" : "不能覆盖原稿",
+  const canApply = !over && !diff && conv.T > 0;
+  const buttons = [{ label: "取消", action: () => { pendingSwitch = null; closeModal(); } }];
+  if (conv.T === 0) {
+    // 每一纬都是漏织哨兵：没有任何有效开口，无法归并出踏板
+    buttons.push({ label: "全部纬均漏织，无法转换", disabled: true,
+                   title: "请先在升综计划中至少画出一纬开口" });
+  } else if (over && !diff) {
+    // 仅踏板数不足：允许直接把预算提高到所需数量后采用（原稿仍保留在撤销栈中）
+    buttons.push({
+      label: `增至 ${conv.T} 片并采用`,
+      primary: true,
+      action: () => applySwitchToTreadle(conv.T),
+    });
+    buttons.push({
+      label: "仅把预算改为 " + conv.T,
+      action: () => {
+        state.T = conv.T;
+        $("#treadles").value = conv.T;
+        pendingSwitch = null;
+        closeModal();
+        pushHistory();
+        toast(`踏板预算已改为 ${conv.T}，可重新切回预览`);
+      },
+    });
+  } else {
+    buttons.push({
+      label: canApply ? "采用并切换" : "成布不一致，不能覆盖原稿",
       primary: canApply,
       action: () => { if (canApply) applySwitchToTreadle(); },
-    },
-  ], true);
-  if (!canApply) {
-    const last = $("#modalFoot").lastElementChild;
-    last.disabled = true;
-    last.title = over ? "所需踏板超过设定数量" : "成布不一致";
+    });
   }
+  openModal("切回踏板组织图 · 转换预览", body, buttons, true);
+  // 成布真的不一致且非踏板数问题时，末位按钮在上面已置为禁用文案
 }
 
 /* 小网格预览（通用黑白/单色点） */
@@ -1873,12 +1971,13 @@ function clothDiffMiniSvg(cur, nv) {
   return wrap;
 }
 
-function applySwitchToTreadle() {
+function applySwitchToTreadle(newT) {
   if (!pendingSwitch) return;
   const conv = pendingSwitch.conv;
   state.tieup = conv.tieup;
   state.treadling = conv.treadling;
-  state.T = conv.T;   // 归并后的实际踏板数（不超过设定）
+  // 归并后的实际踏板数；用户选择“增至所需”时可把预算一并提高
+  state.T = Math.max(conv.T, newT || 0);
   state.mode = "treadle";
   pendingSwitch = null;
   stopPlay(); play.pick = -1;
@@ -1940,7 +2039,8 @@ function exportWIF() {
     lines.push(`${shaft}={${arr.join(",")}}`);
 
   if (isLift) {
-    // 直提模式：按 LIFTPLAN 写出每纬升起的综框；漏织纬写 0
+    // 直提模式：按 LIFTPLAN 写出每纬升起的综框；
+    // 全沉纬与漏织哨兵在 WIF 中都只能表达为 0（无综升起）
     lines.push("[LIFTPLAN]");
     for (let p = 0; p < P; p++) {
       if (isDeadLiftPick(p)) { lines.push(`${p + 1}=0`); continue; }
@@ -1994,26 +2094,38 @@ function importWIF(text) {
   // WIF 含 LIFTPLAN 时原样保留：进入直提模式，不合成踏板。
   // 若同时带 TIEUP/TREADLING 也读入保留，方便日后切回踏板模式参考。
   const useLift = Object.keys(lp).length > 0;
+  let liftComboCount = 0;       // 不同升综组合数（含全沉组合），用作踏板预算初值
   if (useLift) {
     const seen = new Uint8Array(P);
+    const combos = new Set();
     for (const keyStr of Object.keys(lp)) {
       const p = parseInt(keyStr, 10);
       if (!Number.isFinite(p)) continue;
       const shafts = parseList(lp[keyStr]);
-      if (!shafts.length || (shafts.length === 1 && shafts[0] === 0)) {
-        liftplan.add(key(p - 1, LIFT_DEAD)); // 漏织纬
+      if (shafts.length === 1 && shafts[0] === 0) {
+        // WIF 的 pick=0：有效全沉纬（无综升起），不是漏织，不写任何键
+      } else if (!shafts.length) {
+        // 空值同样视为全沉纬
       } else {
+        const row = [];
         for (const sh of shafts) {
           if (Number.isFinite(sh)) {
             liftplan.add(key(p - 1, sh - 1));
             S = Math.max(S, sh);  // LIFTPLAN 也决定综框数
+            row.push(sh);
           }
         }
+        row.sort((a, b) => a - b);
+        combos.add(row.join(","));
       }
       seen[p - 1] = 1;
     }
-    // 缺号的纬也按漏织补齐，保证纬数与 WEFT.THREADS 一致
-    for (let p = 0; p < P; p++) if (!seen[p]) liftplan.add(key(p, LIFT_DEAD));
+    // 缺号的纬同样按全沉纬处理（LIFTPLAN 中无键即全沉）
+    let hasEmpty = false;
+    for (let p = 0; p < P; p++) if (!seen[p]) { hasEmpty = true; }
+    if (Object.values(lp).some((v) => { const l = parseList(v); return !l.length || (l.length === 1 && l[0] === 0); }) || hasEmpty)
+      combos.add("");
+    liftComboCount = combos.size;
   }
   for (const keyStr of Object.keys(ti)) {
     const shaft = parseInt(keyStr, 10);
@@ -2036,7 +2148,7 @@ function importWIF(text) {
     throw new Error("WIF 缺少必要尺寸（WARP.THREADS / WEFT.THREADS / 穿综）");
   if (!useLift && !T)
     throw new Error("WIF 缺少必要的踏板数据（TIEUP/TREADLING 或 LIFTPLAN）");
-  if (useLift && !T) T = 1; // 直提模式不需要踏板，留 1 片占位供设置条显示
+  if (useLift && !T) T = Math.max(1, liftComboCount); // 直提模式：按所需踏板组合预设预算
 
   state.S = S; state.T = T; state.E = E; state.P = P;
   state.threading = threading; state.tieup = tieup; state.treadling = treadling;
@@ -2454,7 +2566,8 @@ function openModal(title, bodyNode, buttons, wide) {
     const bEl = document.createElement("button");
     bEl.textContent = btn.label;
     if (btn.primary) bEl.className = "primary";
-    bEl.addEventListener("click", btn.action);
+    if (btn.disabled) { bEl.disabled = true; bEl.title = btn.title || ""; }
+    if (btn.action) bEl.addEventListener("click", btn.action);
     foot.appendChild(bEl);
   }
   $("#modalBox").classList.toggle("wide", !!wide);
@@ -2575,13 +2688,13 @@ function syncSetupInputs() {
 function updateShedHint() {
   if (state.mode === "lift") {
     $("#shedHint").textContent = state.shed === "rising"
-      ? "直提·提综：LIFTPLAN 标记＝该综本纬升起，正面见经（黑格）"
-      : "直提·沉综：LIFTPLAN 仍标记升起综框；未标综沉下，正面见纬（白格）";
+      ? "直提 · 提综：标记＝升起（经浮）"
+      : "直提 · 沉综：标记＝升起，未标综沉下（纬浮）";
     return;
   }
   $("#shedHint").textContent = state.shed === "rising"
-    ? "提综逻辑：连结标记＝该综上升，正面见经（黑格）"
-    : "沉综逻辑：连结标记＝该综下沉，正面见纬（白格）";
+    ? "提综：连结标记＝综上升，正面见经"
+    : "沉综：连结标记＝综下沉，正面见纬";
 }
 function onResizeField(which, val) {
   val = clamp(val | 0, which === "shafts" ? 2 : 1, 600);
@@ -2591,7 +2704,9 @@ function onResizeField(which, val) {
   const map = { shafts: "S", treadles: "T", ends: "E", picks: "P" };
   state[map[which]] = val;
   stopPlay(); play.pick = -1;
-  rebuildAll();
+  // 直提模式下调“踏板预算”不影响任何现有数据，只记一笔历史即可
+  if (!(which === "treadles" && state.mode === "lift")) rebuildAll();
+  else syncSetupInputs();
   pushHistory();
   const names = { shafts: "综框", treadles: "踏板", ends: "经纱", picks: "纬纱" };
   const orphaned = hasOutOfRange(which);
