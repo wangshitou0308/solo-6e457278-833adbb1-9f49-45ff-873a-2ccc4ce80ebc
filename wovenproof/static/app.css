@@ -669,6 +669,9 @@ input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allow
 #sbTreadling .sb-cell.mark { background: #2456a6; border-radius: 35%; }
 #sbTieup .sb-cell.bad { outline: 2px solid var(--red); outline-offset: -2px; z-index: 2; }
 .sb-cell.rowbad { outline: 2px solid var(--red); outline-offset: -2px; }
+/* 同踩数超上限：琥珀色角标描边（与开口错误的红框同时出现时红框优先） */
+.sb-cell.overk { box-shadow: inset -3px -3px 0 -1px var(--amber); }
+.sb-cell.rowbad.overk { outline: 2px solid var(--red); }
 .sb-cell.lock {
   cursor: not-allowed;
   background-image: linear-gradient(135deg, transparent 44%, #e0d8c6 44%, #e0d8c6 56%, transparent 56%);

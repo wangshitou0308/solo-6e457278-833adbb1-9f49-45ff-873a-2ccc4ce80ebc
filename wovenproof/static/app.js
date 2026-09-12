@@ -1959,6 +1959,45 @@ function solveCompound(budget, K, lock) {
     return [...best.values()].sort((a, b) => a.news.length - b.news.length || a.size - b.size);
   });
 
+  /* ---- 结构性可行基（不依赖回溯，保证可解场景一定出候选） ---- */
+  // 候选池/回溯受节点与时间上限约束，可能漏掉“多开口共享单综块”一类解；
+  // 显式构造两个恒成立的基兜底：
+  //   A 每个不同开口独占一片踏板（并集＝该开口本身，恒为 1 踩）；
+  //   B 每个出现过的综框一片单综踏板，同纬同踩（要求该开口综数 ≤ K）。
+  // 固定列若已含同掩码踏板则自动抵扣，不必新增。
+  const poolIdOf = new Map();
+  pool.forEach((m, id) => poolIdOf.set(m, id));
+  const lockMaskSet = new Set(lockMasks.map((m) => m >>> 0));
+  const reserveZero0 = hasZero && lockMasks.indexOf(0) < 0 ? 1 : 0;
+  const needPoolId = (mask) => {
+    if (lockMaskSet.has(mask)) return null; // 固定列已提供
+    return poolIdOf.get(mask);              // 候选池一定含行掩码与单综块
+  };
+  const rowBasisIds = new Set();      // 基 A
+  const singletonIds = new Set();    // 基 B
+  for (const m of rows) {
+    const id = needPoolId(m);
+    if (id !== null) rowBasisIds.add(id);
+  }
+  for (let s = 0; s < state.S; s++) {
+    if (!((usedBits >>> s) & 1)) continue;
+    const id = needPoolId((1 << s) >>> 0);
+    if (id !== null) singletonIds.add(id);
+  }
+  const maxRowPop = rows.reduce((mx, m) => Math.max(mx, popcount32(m)), 0);
+
+  const forcedBases = [];
+  if (nLock + rowBasisIds.size + reserveZero0 <= budget) forcedBases.push(rowBasisIds);
+  // 基 B：每行要踩的单综踏板数（固定列已覆盖的综可省踩）不超过 K，且块数在预算内
+  let basisBRowOK = true;
+  for (const m of rows) {
+    let need = popcount32(m);
+    for (const lm of lockMasks) if (popcount32(lm) === 1 && (lm & m) === lm) need--;
+    if (need > K) { basisBRowOK = false; break; }
+  }
+  if (basisBRowOK && nLock + singletonIds.size + reserveZero0 <= budget)
+    forcedBases.push(singletonIds);
+
   /* ---- 回溯：为每个行掩码选一组覆盖，最少新增块 ---- */
   const order = rows.map((m, i) => i).sort((a, b) => rowOpts[a].length - rowOpts[b].length);
   const leaves = new Map(); // 掩码签名 -> {used:Set, maxSize}
@@ -1967,25 +2006,20 @@ function solveCompound(budget, K, lock) {
   let nodes = 0;
   let searchCapped = false;
   const deadline = Date.now() + 450;
-  let bestCount = Infinity;
+  // 结构性可行基的最小新增块数，作为回溯上界，尽早剪掉过大分支
+  let bestCount = forcedBases.reduce((mx, b) => Math.min(mx, b.size), Infinity);
 
-  // 全局快速容许下界：每个不同行掩码至少要新增的块数取最大；
-  // 下界已超预算时直接判无解，避免大规模回溯
-  const reserveZero0 = hasZero && lockMasks.indexOf(0) < 0 ? 1 : 0;
+  // 全局快速容许下界：每个不同行掩码至少要新增的块数取最大
   let globalLB = 0;
   for (const opts of rowOpts) {
     let mn = Infinity;
     for (const o of opts) if (o.news.length < mn) mn = o.news.length;
     if (mn > globalLB) globalLB = mn;
   }
-  if (globalLB + reserveZero0 > budgetNew) {
-    const fail = greedyFailure(rowOpts, order, rows, pool, lockMasks, nLock, budget, budgetNew,
-                               hasZero, tieMasks, upMasks, dead, P, FULL);
-    fail.capped = false;
-    return { ok: false, fail };
-  }
+  const provablyInfeasible = globalLB + reserveZero0 > budgetNew && !forcedBases.length;
+  if (!provablyInfeasible) {
 
-  // 贪心预解：给 bestCount 一个紧上界，使后续分支尽早被剪掉
+  // 贪心预解：再给 bestCount 一个紧上界
   {
     const used = new Set();
     for (const ri of order) {
@@ -1997,7 +2031,7 @@ function solveCompound(budget, K, lock) {
       }
       if (best) for (const id of best.news) used.add(id);
     }
-    if (used.size + reserveZero0 <= budgetNew) bestCount = used.size;
+    if (used.size + reserveZero0 <= budgetNew) bestCount = Math.min(bestCount, used.size);
   }
 
   // 预计算每个行选项的“新增块”掩码（pool 最多 520，用两个 32 位字）
@@ -2055,24 +2089,40 @@ function solveCompound(budget, K, lock) {
     }
   }
   dfs(0, 0, 0, 0);
+  } // end !provablyInfeasible
 
-  /* ---- 评估每个基：排板、逐纬脚法 Viterbi 最省换脚 ---- */
+  /* ---- 评估：回溯基 + 两个结构性可行基（后者保证可解稿必有零差异候选） ---- */
   const sols = [];
   const evalCache = new Map(); // 列掩码集合签名 -> 每行掩码的踩法缓存
-  for (const leaf of leaves.values()) {
-    const sol = evaluateBasis(leaf.used, pool, lockMasks, nLock, tieMasks, dead,
+  const seenSig = new Set();
+  const tryBasis = (ids) => {
+    const sol = evaluateBasis(ids, pool, lockMasks, nLock, tieMasks, dead,
                               K, budget, FULL, evalCache);
-    if (sol) sols.push(sol);
-  }
+    if (!sol) return;
+    const sig = [...sol.tieup].sort().join(",") + "|" + sol.planT;
+    if (seenSig.has(sig)) return;
+    seenSig.add(sig);
+    sols.push(sol);
+  };
+  for (const leaf of leaves.values()) tryBasis(leaf.used);
+  for (const b of forcedBases) tryBasis(b);
   sols.sort((a, b) =>
     a.planT - b.planT || a.maxPress - b.maxPress || a.foot - b.foot || a.usedCount - b.usedCount);
   const top = sols.slice(0, 8);
 
   if (top.length) return { ok: true, sols: top, capped: searchCapped, budget, K, lock, nLock };
 
-  /* ---- 限制内无解：贪心找出放不下的开口 ---- */
-  const fail = greedyFailure(rowOpts, order, rows, pool, lockMasks, nLock, budget, budgetNew,
-                             hasZero, tieMasks, upMasks, dead, P, FULL);
+  /* ---- 限制内无解 ---- */
+  let fail;
+  if (maxRowPop > K) {
+    // 某纬目标并集含综数 > K：至多 K 片踏板无法逐综覆盖
+    fail = { reason: "overshed", budget, nLock, K,
+      groups: collectFailGroups(tieMasks, upMasks, dead, P,
+        new Set(rows.filter((m) => popcount32(m) > K))) };
+  } else {
+    fail = greedyFailure(rowOpts, order, rows, pool, lockMasks, nLock, budget, budgetNew,
+                         hasZero, tieMasks, upMasks, dead, P, FULL);
+  }
   fail.capped = searchCapped;
   return { ok: false, fail };
 }
@@ -2498,6 +2548,10 @@ function renderFailure(fail) {
   } else if (fail.reason === "lockover") {
     budgetHint = `<div class="conv-warn">固定列已有 ${fail.nLock} 片，超过踏板预算 ${fail.budget}。
        请提高预算（不能删除固定列），或取消锁定后重解。</div>`;
+  } else if (fail.reason === "overshed") {
+    budgetHint = `<div class="conv-warn">这些纬一纬要同时升起 ${fail.K + 1} 片以上综框，
+       超过“每纬最多同踩 ${fail.K} 片”的上限，任何踏板连结都无法在限制内还原。
+       请调高每纬最多同踩数，直提稿保持不变。</div>`;
   } else {
     budgetHint = `<div class="conv-warn">在踏板预算 ${fail.budget} 片${fail.nLock ? `（含 ${fail.nLock} 列固定）` : ""}、
        每纬最多同踩的限制内，以下纬的目标开口无法用踏板连结并集还原。
@@ -2641,14 +2695,16 @@ function refreshSandbox() {
     colMask[t] = m >>> 0;
   }
   const press = [];
-  let maxPress = 0, foot = 0, wrongPicks = 0;
-  const badTie = new Set();   // "s:t" 造成错误开口的连结格
-  const badRows = new Set();  // 踏序错误行（数据行号 p）
+  let maxPress = 0, foot = 0, wrongPicks = 0, overKPicks = 0;
+  const badTie = new Set();    // "s:t" 造成错误开口的连结格
+  const badRows = new Set();   // 踏序开口错误行（数据行号 p）
+  const overKRows = new Set(); // 同踩数超上限的行
   for (let p = 0; p < state.P; p++) {
     const ps = [];
     for (let t = 0; t < sb.T; t++) if (sb.treadling.has(key(p, t))) ps.push(t);
     press.push(ps);
-    maxPress = Math.max(maxPress, ps.length);
+    if (ps.length > maxPress) maxPress = ps.length;
+    if (ps.length > sb.K) { overKPicks++; overKRows.add(p); }
     let union = 0;
     for (const t of ps) union |= colMask[t];
     union >>>= 0;
@@ -2658,10 +2714,21 @@ function refreshSandbox() {
     if (!ok) {
       wrongPicks++;
       badRows.add(p);
-      const diffShafts = dead[p] ? union : (union ^ tieMasks[p]) >>> 0;
-      for (const t of ps)
+      // 标出造成目标开口变化的连结格：
+      // 多并出的综（XOR）由相关踩下列的连结格负责；
+      // 缺少的综（目标有而并集没有）说明应有连结被删，相关踩下列也整列标出
+      const extra = dead[p] ? union : (union & ~tieMasks[p]) >>> 0;
+      const missing = dead[p] ? 0 : (tieMasks[p] & ~union) >>> 0;
+      for (const t of ps) {
+        // 多并出的综：标出该踩下列上对应的连结格
         for (let s = 0; s < state.S; s++)
-          if ((diffShafts >>> s) & 1) badTie.add(key(s, t));
+          if ((extra >>> s) & 1) badTie.add(key(s, t));
+        // 缺少的综：标出“该纬踩下列中本该连而被删掉”的连结格
+        if (missing) {
+          for (let s = 0; s < state.S; s++)
+            if ((missing >>> s) & 1 && !sb.tieup.has(key(s, t))) badTie.add(key(s, t));
+        }
+      }
     }
   }
   for (let p = 1; p < state.P; p++) foot += footChange(press[p - 1], press[p]);
@@ -2682,6 +2749,7 @@ function refreshSandbox() {
       const cell = trEl.children[r * sb.T + t];
       cell.classList.toggle("mark", sb.treadling.has(key(p, t)));
       cell.classList.toggle("rowbad", badRows.has(p));
+      cell.classList.toggle("overk", overKRows.has(p));
     }
   }
 
@@ -2701,23 +2769,53 @@ function refreshSandbox() {
     `成布差异（红消失/绿新增，当前 ${diff} 格不同）`;
   diffBox.appendChild(diffWrap);
 
+  // 采用条件：每一纬目标开口完全一致（不是只看成布，未穿综综框也必须保持），
+  // 且每纬同踩数不超过设定上限 K；任一不满足都禁用采用。
+  const openOK = wrongPicks === 0;
+  const pressOK = maxPress <= sb.K;
+  const adoptable = openOK && pressOK;
+
   // 状态条
   const bar = document.getElementById("sbBar");
   const items = [];
-  items.push(diff === 0
-    ? `<span class="sb-badge ok">成布差异 0 · 可采用</span>`
-    : `<span class="sb-badge bad">成布差异 ${diff} 格 · ${wrongPicks} 纬开口不符</span>`);
+  if (adoptable && diff === 0)
+    items.push(`<span class="sb-badge ok">目标开口一致 · 同踩不超限 · 成布差异 0 · 可采用</span>`);
+  else {
+    if (!openOK)
+      items.push(`<span class="sb-badge bad">${wrongPicks} 纬目标开口已改变（红框处）</span>`);
+    if (!pressOK)
+      items.push(`<span class="sb-badge warn">最大同踩 ${maxPress} 片，超过上限 ${sb.K}（${overKPicks} 纬）</span>`);
+    if (openOK && pressOK && diff !== 0)
+      items.push(`<span class="sb-badge bad">成布差异 ${diff} 格</span>`);
+  }
   items.push(`<span class="sb-badge">踏板 ${sb.T} 片（预算 ${sb.budget}）</span>`);
-  items.push(maxPress > sb.K
-    ? `<span class="sb-badge warn">最大同踩 ${maxPress} 片，超出设定 ${sb.K}（仍可零差异采用）</span>`
-    : `<span class="sb-badge">最大同踩 ${maxPress} 片（限 ${sb.K}）</span>`);
+  items.push(`<span class="sb-badge">最大同踩 ${maxPress} 片（限 ${sb.K}）</span>`);
+  items.push(`<span class="sb-badge">成布差异 ${diff} 格</span>`);
   items.push(`<span class="sb-badge">相邻纬换脚 ${foot} 次</span>`);
   bar.innerHTML = items.join("");
   const adopt = document.getElementById("sbAdopt");
-  if (adopt) adopt.disabled = diff !== 0;
+  if (adopt) adopt.disabled = !adoptable;
 }
 
 function adoptSandbox() {
+  // 二次校验：采用前重新确认目标开口一致且同踩数不超 K（防止状态过期）
+  const { tieMasks, dead } = solverTargets();
+  const colMask = new Array(sb.T).fill(0);
+  for (let t = 0; t < sb.T; t++) {
+    let m = 0;
+    for (let s = 0; s < state.S; s++) if (sb.tieup.has(key(s, t))) m |= (1 << s) >>> 0;
+    colMask[t] = m >>> 0;
+  }
+  for (let p = 0; p < state.P; p++) {
+    const ps = [];
+    for (let t = 0; t < sb.T; t++) if (sb.treadling.has(key(p, t))) ps.push(t);
+    if (ps.length > sb.K) { toast("存在同踩数超过上限的纬，不能采用", 2600); return; }
+    let union = 0;
+    for (const t of ps) union |= colMask[t];
+    union >>>= 0;
+    const ok = dead[p] ? ps.length === 0 : ps.length > 0 && union === tieMasks[p];
+    if (!ok) { toast("存在目标开口不一致的纬（红框处），不能采用", 2600); return; }
+  }
   const T = sb.T;
   const tieup = new Set(sb.tieup), treadling = new Set(sb.treadling);
   solverUI = null;
