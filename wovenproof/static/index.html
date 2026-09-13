@@ -138,6 +138,7 @@
       <button data-tab="variant">变体</button>
       <button data-tab="repeat">循环校验</button>
       <button data-tab="reed">穿筘</button>
+      <button data-tab="warp">整经</button>
       <button data-tab="colors">色纱</button>
       <button data-tab="help">帮助</button>
     </nav>
@@ -272,6 +273,49 @@
       </p>
     </div>
 
+    <div class="tab-pane" id="paneWarp">
+      <div class="rule-box warp-box">
+        <div class="rule-title">整经批次参数（独立于组织图保存）</div>
+        <label class="full">批次名 <input id="warpName" type="text" style="flex:1;min-width:120px"></label>
+        <label>成品长度 <input id="warpFinished" type="number" min="0" step="0.1" value="2"> <span>米</span></label>
+        <label>织缩 <input id="warpTakeUp" type="number" min="0" max="95" step="0.5" value="8"> <span>%</span></label>
+        <label>缩水 <input id="warpShrink" type="number" min="0" max="95" step="0.5" value="5"> <span>%</span></label>
+        <label>机前损耗 <input id="warpWasteFront" type="number" min="0" step="0.05" value="0.5"> <span>米</span></label>
+        <label>机后损耗 <input id="warpWasteBack" type="number" min="0" step="0.05" value="0.7"> <span>米</span></label>
+        <label>每绞根数上限 <input id="warpMaxPer" type="number" min="1" max="600" value="40"></label>
+        <label class="full">分绞规则
+          <select id="warpRule" style="flex:1">
+            <option value="cycle">完整配色循环优先（建议按循环成绞）</option>
+            <option value="max">按根数上限均分（不看配色）</option>
+            <option value="manual">手工拖动边界</option>
+          </select></label>
+        <label class="ck full"><input type="checkbox" id="warpBindReed" checked>
+          绑定已采用的穿筘方案（上机单带筘齿；未采用则仅记录）</label>
+        <div class="warp-actions full">
+          <button id="btnWarpSuggest" title="按根数上限与完整配色循环生成分绞边界（不改变经纱顺序）">🧮 生成分组建议</button>
+          <button id="btnWarpLock" class="primary" title="冻结当前经纱次序、颜色与绑定的穿筘方案">🔒 锁定批次</button>
+          <button id="btnWarpUnlock" title="回到草拟，可继续改参数与边界">🔓 解锁</button>
+          <button id="btnWarpExec" class="primary">▶ 开始 / 继续执行</button>
+          <button id="btnWarpPrint">🖨 打印上机单</button>
+          <button id="btnWarpSave">💾 保存批次</button>
+          <button id="btnWarpList">🗂 批次列表</button>
+          <button id="btnWarpNew">＋ 新建批次</button>
+        </div>
+      </div>
+      <div class="warp-status" id="warpStatus">状态：草拟</div>
+      <div class="warp-stats" id="warpStats"></div>
+      <div class="warp-band-title" id="warpBandTitle">
+        连续色带（按经纱次序展开；草拟时可拖动 ⌖ 手柄调整分绞边界，点击色条定位穿综格）
+      </div>
+      <div class="warp-band-scroll" id="warpBand"></div>
+      <ul class="issue-list" id="warpIssueList"></ul>
+      <p class="small muted warp-help">
+        批次从当前组织图读取经纱次序与颜色，本身不改组织图。锁定时冻结来源：之后组织图或穿筘方案有变动，
+        只标记「来源已变更」，不会重排批次。执行页逐根确认经纱，可撤销上一根、随时中断续做；
+        全部完成后封存记录并可打印带色条、综框、筘齿与分绞标签的上机单。
+      </p>
+    </div>
+
     <div class="tab-pane" id="paneColors">
       <div class="rule-box">
         <div class="rule-title">色纱（用于打印图）</div>
@@ -340,6 +384,19 @@
           <li>实时给出实际幅宽、整体与分段（左边/地经/右边）经密，并把每根经纱对齐到筘齿。</li>
           <li>状态分<b>草拟 / 已校验 / 已采用</b>：无错误才能校验；校验/采用后再改任一参数即回到草拟。总经数不符、空齿位置错误、边经超限、色序错位等问题只定位到具体经纱与筘齿，<b>不自动补线</b>。</li>
           <li>采用方案前可并排比较候选的幅宽、经密误差与超限筘齿；采用后进入撤销/重做、浏览器草稿与项目版本存档，并可打印带穿综、穿筘、颜色的<b>穿经单</b>（仅已校验/已采用可打印）。</li>
+        </ul>
+        <h3>整经批次</h3>
+        <ul>
+          <li>「整经」页把当前组织图的<b>经纱次序与颜色</b>展开成连续色带，独立保存成品长度、织缩、缩水、
+            机前机后损耗、每绞根数上限与分绞规则；可绑定<b>已采用</b>的穿筘方案（上机单带筘齿号）。</li>
+          <li>批次依次处于<b>草拟 → 已锁定 → 执行中 → 已完成</b>。锁定时冻结来源；之后组织图或穿筘方案改变
+            只标记「来源已变更」，<b>不重排批次</b>。</li>
+          <li>草拟时可拖动色带上的分绞边界，或按根数上限与完整配色循环<b>生成分组建议</b>（不改变经纱顺序）；
+            页面即时汇总每绞根数、整经长度与各色用量。</li>
+          <li>总经数不符、边界拆开配色循环、边经分散、长度参数无效等问题会定位到相关经纱与分组；
+            有错误时不能锁定。</li>
+          <li>执行页逐根高亮经纱号、颜色、所属绞与分绞十字方向（绞内奇偶交替上/下），支持确认、
+            撤销上一根与中断续做；全部完成后封存记录，并打印带色条、综框、筘齿与分绞标签的上机单。</li>
         </ul>
         <h3>WIF</h3>
         <p class="small">支持导入/导出标准 WIF：THREADING/TIEUP/TREADLING 或 LIFTPLAN、WARP/WEFT COLORS、SHED。

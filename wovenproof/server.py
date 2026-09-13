@@ -68,6 +68,19 @@ def init_db():
             """DELETE FROM versions
                WHERE project_id NOT IN (SELECT id FROM projects)"""
         )
+        # 整经批次：独立于项目/版本之外的生产数据，整包 JSON 存取
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS warp_batches (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                name    TEXT NOT NULL,
+                status  TEXT NOT NULL DEFAULT 'draft',
+                data    TEXT NOT NULL,
+                created REAL NOT NULL,
+                updated REAL NOT NULL
+            )
+            """
+        )
 
 
 class ApiError(Exception):
@@ -116,6 +129,10 @@ class Handler(BaseHTTPRequestHandler):
             parts = [p for p in path.split("/") if p]
             if path == "/api/projects":
                 return self._list_projects()
+            if path == "/api/warpbatches":
+                return self._list_warp_batches()
+            if len(parts) == 3 and parts[:2] == ["api", "warpbatches"]:
+                return self._get_warp_batch(int(parts[2]))
             if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[2] == "versions":
                 return self._get_version(int(parts[3]))
             if len(parts) == 3 and parts[:2] == ["api", "projects"]:
@@ -132,9 +149,24 @@ class Handler(BaseHTTPRequestHandler):
             data = self._read_json()
             if path == "/api/projects":
                 return self._save_project(data)
+            if path == "/api/warpbatches":
+                return self._create_warp_batch(data)
             if path.endswith("/versions"):
                 pid = path.split("/")[3]
                 return self._save_version(int(pid), data)
+            raise ApiError(404, "未知接口")
+        except ApiError as exc:
+            return self._error(exc)
+        except ValueError:
+            return self._error(ApiError(400, "无效的编号"))
+
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        try:
+            data = self._read_json()
+            parts = [p for p in path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "warpbatches"]:
+                return self._update_warp_batch(int(parts[2]), data)
             raise ApiError(404, "未知接口")
         except ApiError as exc:
             return self._error(exc)
@@ -174,6 +206,15 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("DELETE FROM versions WHERE id=? AND project_id=?",
                                  (vid, pid))
                 return self._send_json({"ok": True, "deleted": "version", "id": vid})
+            if len(parts) == 3 and parts[:2] == ["api", "warpbatches"]:
+                bid = int(parts[2])
+                with db_connect() as conn:
+                    row = conn.execute(
+                        "SELECT 1 FROM warp_batches WHERE id=?", (bid,)).fetchone()
+                    if row is None:
+                        raise ApiError(404, f"整经批次 #{bid} 不存在")
+                    conn.execute("DELETE FROM warp_batches WHERE id=?", (bid,))
+                return self._send_json({"ok": True, "deleted": "warp_batch", "id": bid})
             raise ApiError(404, f"未知地址：{path}")
         except ApiError as exc:
             return self._error(exc)
@@ -289,6 +330,91 @@ class Handler(BaseHTTPRequestHandler):
                  json.dumps(draft, ensure_ascii=False), now))
             conn.execute("UPDATE projects SET updated=? WHERE id=?", (now, pid))
         self._send_json({"ok": True, "versionId": cur.lastrowid})
+
+    # ---------- 整经批次 ----------
+    WARP_STATUSES = ("draft", "locked", "running", "done")
+
+    @classmethod
+    def _validate_warp_payload(cls, data, partial=False):
+        """校验批次写入体；partial=True 时允许只更新部分字段。"""
+        out = {}
+        if not partial or "name" in data:
+            name = str(data.get("name") or "").strip()
+            if not name:
+                raise ApiError(400, "批次名称不能为空")
+            out["name"] = name[:80]
+        if not partial or "status" in data:
+            status = str(data.get("status") or "draft")
+            if status not in cls.WARP_STATUSES:
+                raise ApiError(400, f"批次状态必须是 {'/'.join(cls.WARP_STATUSES)} 之一")
+            out["status"] = status
+        if not partial or "data" in data:
+            payload = data.get("data")
+            if not isinstance(payload, dict):
+                raise ApiError(400, "缺少 data 数据")
+            out["data"] = json.dumps(payload, ensure_ascii=False)
+        return out
+
+    @staticmethod
+    def _warp_summary(row):
+        """列表用摘要：从整包 JSON 里挑几个展示字段，解析失败也不影响列表。"""
+        item = {"id": row["id"], "name": row["name"], "status": row["status"],
+                "created": row["created"], "updated": row["updated"]}
+        try:
+            d = json.loads(row["data"])
+            frozen = d.get("frozen") or {}
+            item["ends"] = frozen.get("E") or d.get("ends") or 0
+            item["progress"] = d.get("progress") or 0
+            item["sections"] = len(d.get("cuts") or []) + 1
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return item
+
+    def _list_warp_batches(self):
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM warp_batches ORDER BY updated DESC").fetchall()
+        self._send_json({"ok": True,
+                         "batches": [self._warp_summary(r) for r in rows]})
+
+    def _get_warp_batch(self, bid):
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM warp_batches WHERE id=?", (bid,)).fetchone()
+        if row is None:
+            raise ApiError(404, "整经批次不存在")
+        batch = self._warp_summary(row)
+        try:
+            batch["data"] = json.loads(row["data"])
+        except ValueError:
+            raise ApiError(500, "批次数据损坏，无法解析")
+        self._send_json({"ok": True, "batch": batch})
+
+    def _create_warp_batch(self, data):
+        fields = self._validate_warp_payload(data)
+        now = time.time()
+        with db_connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO warp_batches(name, status, data, created, updated)"
+                " VALUES(?,?,?,?,?)",
+                (fields["name"], fields["status"], fields["data"], now, now))
+            bid = cur.lastrowid
+        self._send_json({"ok": True, "batchId": bid})
+
+    def _update_warp_batch(self, bid, data):
+        fields = self._validate_warp_payload(data, partial=True)
+        if not fields:
+            raise ApiError(400, "没有需要更新的字段")
+        now = time.time()
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM warp_batches WHERE id=?", (bid,)).fetchone()
+            if row is None:
+                raise ApiError(404, "整经批次不存在")
+            sets = ", ".join(f"{k}=?" for k in fields) + ", updated=?"
+            conn.execute(f"UPDATE warp_batches SET {sets} WHERE id=?",
+                         (*fields.values(), now, bid))
+        self._send_json({"ok": True, "batchId": bid})
 
 
 def main():

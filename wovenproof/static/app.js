@@ -22,6 +22,7 @@ const state = {
   colorPrint: false,
   rules: { maxFront: 4, maxBack: 4, edge: true, edgeW: 1 },
   reed: null,            // 穿筘计划独立数据（见 defaultReed()）
+  warpBatch: null,       // 整经批次独立数据（见 defaultWarpBatch()；不入撤销栈）
   cell: 20,
 };
 /* 漏织纬在升综计划里的内部哨兵：键 "p:-1"（WIF 无此概念，导入/导出不写出） */
@@ -388,6 +389,7 @@ function afterEdit() {
   runAnalysis();
   renderDrawdown();
   applyAllRulerMarks();
+  scheduleWarpRefresh();
 }
 
 /* ---------------- 悬停 / 坐标栏 ---------------- */
@@ -3120,6 +3122,7 @@ function applyAllWarp() {
   const v = $("#warpColor").value;
   for (let e = 0; e < state.E; e++) state.warpColors[e] = v;
   renderColorChips(); if (state.colorPrint) renderDrawdown(); scheduleSave();
+  scheduleWarpRefresh();
 }
 function applyAllWeft() {
   const v = $("#weftColor").value;
@@ -3427,7 +3430,10 @@ function openModal(title, bodyNode, buttons, wide) {
   $("#modalBox").classList.remove("xwide");
   $("#modalMask").hidden = false;
 }
-function closeModal() { $("#modalMask").hidden = true; }
+function closeModal() {
+  $("#modalMask").hidden = true;
+  if (warpExecOpen) warpExecClosed();   // 整经执行页关闭＝中断（进度已保存）
+}
 function promptModal(title, question, def) {
   return new Promise((resolve) => {
     const body = document.createElement("div");
@@ -4174,6 +4180,7 @@ function refreshReed() {
   renderReedStats(reedLayoutCache);
   renderReedDiagram(reedLayoutCache);
   renderReedIssues(reedLayoutCache);
+  scheduleWarpRefresh();
 }
 let reedTimer = null;
 function scheduleReedRefresh() {
