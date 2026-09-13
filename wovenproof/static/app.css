@@ -677,3 +677,106 @@ input[type="number"]:disabled, select:disabled { opacity: .45; cursor: not-allow
   background-image: linear-gradient(135deg, transparent 44%, #e0d8c6 44%, #e0d8c6 56%, transparent 56%);
 }
 #sbTieup .sb-cell.lock.mark { background-color: #b38a5e; }
+
+/* ============================================================
+   穿筘计划
+   ============================================================ */
+.reed-box label.full { width: 100%; }
+.reed-box .reed-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.reed-box .reed-actions button { flex: 1 1 45%; width: auto; }
+.reed-status {
+  margin: 10px 0 6px;
+  font-weight: 700;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  display: flex; align-items: center; gap: 8px;
+}
+.reed-status.checked { background: var(--blue-soft); color: var(--blue); }
+.reed-status.adopted { background: #dff0e4; color: var(--green); }
+.reed-status .reed-status-note { font-weight: 400; font-size: 11px; color: var(--muted); }
+.reed-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.reed-stat {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  background: #fdfcf8;
+  font-size: 11px;
+  color: var(--muted);
+}
+.reed-stat b { display: inline-block; color: var(--ink); font-size: 13px; }
+.reed-stat.bad b { color: var(--red); }
+.reed-stat.warn b { color: var(--amber); }
+.reed-stat.ok b { color: var(--green); }
+.reed-diagram-title { font-size: 11px; color: var(--muted); margin: 4px 0; }
+.reed-diagram-scroll {
+  overflow: auto;
+  max-height: 220px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px;
+  margin-bottom: 10px;
+}
+#reedSvg { display: block; cursor: crosshair; }
+.reed-selvedge-bg { fill: rgba(138,90,43,.07); }
+.reed-end { stroke: rgba(0,0,0,.25); stroke-width: .12; cursor: pointer; }
+.reed-end:hover { stroke: var(--blue); stroke-width: .35; }
+.reed-dent-box { fill: none; stroke: #8f897b; stroke-width: .22; cursor: pointer; }
+.reed-dent-box:hover { stroke: var(--blue); stroke-width: .5; }
+.reed-dent-empty { fill: rgba(127,140,141,.18); }
+.reed-dent-issue { stroke: var(--red) !important; stroke-width: .6 !important; }
+.reed-end-issue { stroke: var(--red) !important; stroke-width: .6 !important; }
+.reed-flash { animation: reed-flash 1.6s ease-out; }
+@keyframes reed-flash {
+  0% { filter: drop-shadow(0 0 1.5px var(--blue)) drop-shadow(0 0 3px var(--blue)); }
+  100% { filter: none; }
+}
+.reed-txt { font-size: 3.2px; fill: #fff; text-anchor: middle; pointer-events: none; font-family: sans-serif; }
+.reed-num { font-size: 3.4px; fill: var(--muted); text-anchor: middle; pointer-events: none; font-family: sans-serif; }
+.reed-num.major { fill: var(--ink); font-weight: 700; }
+.reed-num.clickable { pointer-events: auto; cursor: pointer; }
+.reed-num.edge-num { fill: var(--accent); }
+.reed-lane-txt { font-size: 3px; fill: var(--muted); pointer-events: none; font-family: sans-serif; }
+.reed-help { line-height: 1.6; }
+
+/* 搜索候选 */
+.reed-cand {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  background: #fff;
+}
+.reed-cand:hover { background: #faf6ec; }
+.reed-cand.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.reed-cand-head { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 12px; margin-bottom: 4px; }
+.reed-cand-head b { color: var(--accent); }
+.reed-cand svg { display: block; }
+
+/* ============================================================
+   穿经单打印
+   ============================================================ */
+.print-reed-head { font-size: 12px; margin: 4px 0 8px; }
+.print-reed-head b { font-size: 15px; }
+.print-reed-meta { font-size: 11px; color: #222; margin-top: 3px; }
+table.print-threading {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 10px;
+}
+table.print-threading th, table.print-threading td {
+  border: 1px solid #888;
+  padding: 1px 5px;
+  text-align: center;
+}
+table.print-threading th { background: #eee; }
+.print-swatch { display: inline-block; width: 9px; height: 9px; border: 1px solid #555; vertical-align: middle; }
+.print-reed-svg-wrap { margin: 6px 0; }

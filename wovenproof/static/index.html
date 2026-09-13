@@ -137,6 +137,7 @@
       <button data-tab="issues" class="active">问题校对</button>
       <button data-tab="variant">变体</button>
       <button data-tab="repeat">循环校验</button>
+      <button data-tab="reed">穿筘</button>
       <button data-tab="colors">色纱</button>
       <button data-tab="help">帮助</button>
     </nav>
@@ -230,6 +231,47 @@
       </div>
     </div>
 
+    <div class="tab-pane" id="paneReed">
+      <div class="rule-box reed-box">
+        <div class="rule-title">穿筘计划参数</div>
+        <label class="full">筘号 <input id="reedReedNo" type="number" min="0" step="0.1">
+          <span>每</span>
+          <select id="reedUnit"><option value="cm">厘米</option><option value="in">英寸</option></select>
+          <span>筘齿数</span></label>
+        <label class="full">目标经密 <input id="reedTargetDensity" type="number" min="0" step="0.1">
+          <span>根/<span id="reedDensityUnit">厘米</span></span></label>
+        <label class="full">成品幅宽 <input id="reedWidth" type="number" min="0" step="0.1">
+          <span id="reedWidthUnit">厘米</span></label>
+        <label>筘齿数（幅宽内）<input id="reedDents" type="number" min="0" step="1"
+          title="留空或 0 则按 筘号×幅宽 自动取整计算"></label>
+        <label>每齿入经上限 <input id="reedMaxDent" type="number" min="1" max="10" value="4"></label>
+        <label class="full">入筘序列（循环）<input id="reedSequence" type="text" value="2-2"
+          style="flex:1;min-width:140px" title="用 - 或 , 分隔每齿入经数，如 2-2-3；0=空齿"></label>
+        <label class="ck full"><input type="checkbox" id="reedEdgeOn"> 启用边经规则</label>
+        <label>每侧边经数 <input id="reedEdgeEnds" type="number" min="0" max="200" value="4"></label>
+        <label>边经每齿上限 <input id="reedEdgeMax" type="number" min="1" max="10" value="4"></label>
+        <label class="full">边经序列 <input id="reedEdgeSeq" type="text" value="2-2"
+          style="flex:1;min-width:140px" title="左右边各自按此循环穿入，如 2-2；0=边部空齿"></label>
+        <div class="reed-actions full">
+          <button id="btnReedSearch">🔍 搜索最接近目标经密的方案</button>
+          <button id="btnReedCheck">✔ 校验</button>
+          <button id="btnReedAdopt" class="primary">✔✔ 采用</button>
+          <button id="btnReedPrint">🖨 打印穿经单</button>
+        </div>
+      </div>
+      <div class="reed-status" id="reedStatus">状态：草拟</div>
+      <div class="reed-stats" id="reedStats"></div>
+      <div class="reed-diagram-title">
+        穿筘对齐图（左→右为经纱次序；点击色条定位穿综格，点击齿号定位筘齿）
+      </div>
+      <div class="reed-diagram-scroll" id="reedDiagram"></div>
+      <ul class="issue-list" id="reedIssueList"></ul>
+      <p class="small muted reed-help">
+        经纱次序、穿综与颜色直接读自当前组织图，本模块不会改动它们。校验发现问题时只定位、不自动补线；
+        「采用」后的方案随撤销、浏览器草稿与项目版本一起保存。
+      </p>
+    </div>
+
     <div class="tab-pane" id="paneColors">
       <div class="rule-box">
         <div class="rule-title">色纱（用于打印图）</div>
@@ -290,6 +332,14 @@
           <li>单元若不能平铺还原原稿，会逐格显示差异（红=原稿、绿=平铺），并<b>不</b>标为有效循环。</li>
           <li>有效单元给出 3×3 成布预演：粗框为中心单元，四边红虚线为接缝，边缘色条为色纱相位；浮长与边经交织按<b>首尾相接</b>（跨周期）计算，整行/整列跨周期连续会单独提示，点击问题可同时定位原稿两端。</li>
           <li>经向、纬向起点都可 ±1 旋转并即时对比接缝与颜色变化；预演穿综、踏序/升综计划与经纬色序的改动，确认「采用旋转结果」后写入原稿，并同步到撤销记录、本地草稿、版本、逐纬播放、WIF 与打印图。</li>
+        </ul>
+        <h3>穿筘计划</h3>
+        <ul>
+          <li>「穿筘」页以<b>筘号（每厘米/每英寸筘齿数）、目标经密、成品幅宽、入筘序列与边经规则</b>为独立数据；经纱次序、穿综、颜色直接读自当前组织图，<b>组织图不会被改动</b>。</li>
+          <li>入筘序列用 <code>-</code> 或 <code>,</code> 分隔每齿入经数（如 <code>2-2-3</code>），按循环铺满幅宽内筘齿；<code>0</code> 表示空齿。可手工编排，也可点<b>搜索</b>找最接近目标经密、且疏密变化最小的方案。</li>
+          <li>实时给出实际幅宽、整体与分段（左边/地经/右边）经密，并把每根经纱对齐到筘齿。</li>
+          <li>状态分<b>草拟 / 已校验 / 已采用</b>：无错误才能校验；校验/采用后再改任一参数即回到草拟。总经数不符、空齿位置错误、边经超限、色序错位等问题只定位到具体经纱与筘齿，<b>不自动补线</b>。</li>
+          <li>采用方案前可并排比较候选的幅宽、经密误差与超限筘齿；采用后进入撤销/重做、浏览器草稿与项目版本存档，并可打印带穿综、穿筘、颜色的<b>穿经单</b>（仅已校验/已采用可打印）。</li>
         </ul>
         <h3>WIF</h3>
         <p class="small">支持导入/导出标准 WIF：THREADING/TIEUP/TREADLING 或 LIFTPLAN、WARP/WEFT COLORS、SHED。

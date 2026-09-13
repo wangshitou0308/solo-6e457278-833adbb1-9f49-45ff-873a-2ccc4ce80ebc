@@ -21,6 +21,7 @@ const state = {
   weftColors: [],        // 每根纬纱颜色
   colorPrint: false,
   rules: { maxFront: 4, maxBack: 4, edge: true, edgeW: 1 },
+  reed: null,            // 穿筘计划独立数据（见 defaultReed()）
   cell: 20,
 };
 /* 漏织纬在升综计划里的内部哨兵：键 "p:-1"（WIF 无此概念，导入/导出不写出） */
@@ -109,6 +110,7 @@ function snapshot() {
     threading: [...state.threading], tieup: [...state.tieup], treadling: [...state.treadling],
     liftplan: [...state.liftplan],
     warpColors: state.warpColors, weftColors: state.weftColors,
+    reed: state.reed,
     name: $("#projectName").value,
   });
 }
@@ -132,11 +134,13 @@ function restore(snap) {
   state.liftplan = new Set(d.liftplan || []);
   state.warpColors = d.warpColors || [];
   state.weftColors = d.weftColors || [];
+  state.reed = normalizeReed(d.reed || null);
   $("#projectName").value = d.name || "未命名项目";
   cancelSelection(true);
   syncSetupInputs();
   applyModeUI();
   rebuildAll();
+  syncReedForm(); refreshReed();
 }
 function undo() {
   if (history.index <= 0) return;
@@ -1645,6 +1649,7 @@ function applyVariant() {
   state.shed = d.shed;
   $("#shed").value = d.shed;
   updateShedHint();
+  if (pendingVariant.kind === "mirror") invalidateReedOnWarpChange();
   pendingVariant = null;
   $("#variantActions").hidden = true;
   $("#variantPreview").innerHTML =
@@ -3000,6 +3005,7 @@ function importWIF(text) {
   state.shed = String(weaving.shed || "").toLowerCase().startsWith("sink") ? "sinking" : "rising";
   state.warpColors = parseWIFColors(warp, E);
   state.weftColors = parseWIFColors(weft, P);
+  invalidateReedOnWarpChange();
   const title = get("text").title;
   if (title) $("#projectName").value = title.replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
   syncSetupInputs();
@@ -3105,6 +3111,7 @@ function editChipColor(idx, kind, chipEl) {
     else state.weftColors[idx] = inp.value;
     chipEl.style.background = inp.value;
     if (state.colorPrint) renderDrawdown();
+    scheduleReedRefresh();
   });
   inp.addEventListener("change", () => { inp.remove(); scheduleSave(); });
   inp.click();
@@ -3311,6 +3318,7 @@ function collectDraft() {
     liftplan: [...state.liftplan],
     warpColors: state.warpColors, weftColors: state.weftColors,
     rules: state.rules,
+    reed: state.reed,
   };
 }
 function loadDraft(d, name) {
@@ -3323,12 +3331,14 @@ function loadDraft(d, name) {
   state.liftplan = new Set(d.liftplan || []);
   state.warpColors = d.warpColors || [];
   state.weftColors = d.weftColors || [];
+  state.reed = normalizeReed(d.reed || null);
   if (d.rules) state.rules = Object.assign(state.rules, d.rules);
   if (name) $("#projectName").value = name;
   stopPlay(); play.pick = -1;
   syncSetupInputs();
   applyModeUI();
   rebuildAll();
+  syncReedForm(); refreshReed();
 }
 
 async function openArchive() {
@@ -3501,6 +3511,7 @@ function openExamples() {
       state.mode = "treadle";
       state.warpColors = []; state.weftColors = [];
       state.shed = "rising";
+      invalidateReedOnWarpChange();
       $("#projectName").value = "示例·" + name.split("（")[0];
       syncSetupInputs();
       applyModeUI();
@@ -3553,6 +3564,7 @@ function onResizeField(which, val) {
   else syncSetupInputs();
   pushHistory();
   const names = { shafts: "综框", treadles: "踏板", ends: "经纱", picks: "纬纱" };
+  if (which === "ends") invalidateReedOnWarpChange();
   const orphaned = hasOutOfRange(which);
   if (orphaned) toast(`已缩小${names[which]}数，旧标记被标为越界，可在问题列表一键清除`, 3200);
 }
@@ -3587,8 +3599,994 @@ function clearAll() {
 }
 
 /* ============================================================
-   初始化
+   穿筘计划
+   ------------------------------------------------------------
+   独立数据 state.reed：筘号、目标经密、成品幅宽、入筘序列、边经规则、状态。
+   经纱次序/穿综/颜色读自当前组织图，从不写回。
+   筘齿 dent 全局从左到右 0 起连续编号；段内序号 sIdx 分别从 0 起。
    ============================================================ */
+const REED_LS_STATUS = { draft: "草拟", checked: "已校验", adopted: "已采用" };
+
+function defaultReed() {
+  return {
+    unit: "cm",          // cm=筘号按每厘米 | in=每英寸
+    reedNo: 0,           // 每单位筘齿数
+    targetDensity: 0,    // 目标经密（根/同单位长度）
+    width: 0,            // 成品幅宽（同单位）
+    dentsManual: 0,      // 手工指定幅宽内筘齿数；0=按筘号自动
+    maxPerDent: 4,       // 地经每齿入经上限
+    seq: "2-2",          // 地经入筘序列文本
+    edgeOn: false,       // 启用边经规则
+    edgeEnds: 4,         // 每侧边经根数
+    edgeMax: 4,          // 边经每齿上限
+    edgeSeq: "2-2",      // 边经入筘序列文本（左右边各自循环）
+    status: "draft",     // draft | checked | adopted
+    adoptedAt: 0,        // 采用时间戳
+  };
+}
+function normalizeReed(r) {
+  const d = defaultReed();
+  if (r && typeof r === "object") {
+    for (const k of Object.keys(d))
+      if (r[k] !== undefined) d[k] = r[k];
+    d.unit = d.unit === "in" ? "in" : "cm";
+    d.status = ["draft", "checked", "adopted"].includes(d.status) ? d.status : "draft";
+  }
+  return d;
+}
+const CM_PER_IN = 2.54;
+function reedPerCm(reed) { return reed.unit === "in" ? reed.reedNo / CM_PER_IN : reed.reedNo; }
+function reedDensityTargetPerCm(reed) {
+  return reed.unit === "in" ? reed.targetDensity / CM_PER_IN : reed.targetDensity;
+}
+function reedFromCm(v, reed) { return reed.unit === "in" ? v * CM_PER_IN : v; }
+/* 解析 "2-2-3" / "2,2,3"；返回 {ok, seq, bad}，允许 0（空齿） */
+function parseReedSeq(text) {
+  const bad = [];
+  const seq = [];
+  String(text || "").split(/[-,，、\s]+/).forEach((tok) => {
+    if (!tok) return;
+    if (/^\d+$/.test(tok)) seq.push(+tok);
+    else bad.push(tok);
+  });
+  return { seq, bad, ok: bad.length === 0 && seq.length > 0 };
+}
+function reedAvailableDents(reed) {
+  if (reed.dentsManual > 0) return Math.round(reed.dentsManual);
+  const perCm = reedPerCm(reed);
+  if (!(perCm > 0) || !(reed.width > 0)) return 0;
+  return Math.max(0, Math.round(perCm * reed.width));
+}
+function meanOf(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0; }
+
+/* 展开一个段：把序列循环填入直到放满 need 根。
+   avail 为可用筘齿上限；传 -1 表示不限制（尚未给筘号/幅宽时仅作预览排布）。
+   返回 {dents:[{v,e0,e1,sIdx}], used, endCount, stopped} */
+function reedExpandSection(seq, need, avail, startEnd) {
+  const dents = [];
+  let endCount = 0, e = startEnd, stopped = false;
+  let guard = 0;
+  while (endCount < need) {
+    if ((avail >= 0 && dents.length >= avail) || ++guard > 20000) { stopped = true; break; }
+    const v = seq[dents.length % seq.length];
+    const sIdx = dents.length;
+    if (v === 0) { dents.push({ v: 0, e0: -1, e1: -1, sIdx }); continue; }
+    const take = Math.min(v, need - endCount);
+    dents.push({ v: take, e0: e, e1: e + take - 1, sIdx });
+    e += take; endCount += take;
+  }
+  return { dents, used: dents.length, endCount, stopped };
+}
+
+/* 核心布置计算。返回统计、每齿明细、每根经纱所在齿与问题列表（不做任何自动补线） */
+function computeReedLayout() {
+  const reed = state.reed || (state.reed = defaultReed());
+  const E = state.E;
+  const body = parseReedSeq(reed.seq);
+  const edgeP = parseReedSeq(reed.edgeSeq);
+  const available = reedAvailableDents(reed);
+  const unlimited = available === 0;   // 未给筘号/幅宽：不限齿数，只做预览排布
+  const issues = [];
+
+  if (!body.ok) issues.push({ sev: "error", kind: "reed-badseq",
+    title: "地经入筘序列无法解析",
+    desc: `无法识别的片段：${body.bad.map(escapeHtml).join("、") || "（空）"}。请用 - 或逗号分隔非负整数，如 2-2-3。`,
+    locs: [] });
+  else if (body.seq.every((v) => v === 0)) issues.push({ sev: "error", kind: "reed-badseq",
+    title: "地经入筘序列全是空齿",
+    desc: "序列每齿入经数都是 0，无法穿入任何经纱；至少要有一个正数。", locs: [] });
+  if (reed.edgeOn && !edgeP.ok) issues.push({ sev: "error", kind: "reed-badedge",
+    title: "边经入筘序列无法解析",
+    desc: `无法识别的片段：${edgeP.bad.map(escapeHtml).join("、") || "（空）"}。`, locs: [] });
+  const bodyUsable = body.ok && body.seq.some((v) => v > 0);
+  const edgeUsable = edgeP.ok && edgeP.seq.some((v) => v > 0);
+
+  // 边经总量
+  let edgeCount = 0, edgeNeeds = 0;
+  if (reed.edgeOn) {
+    edgeNeeds = Math.min(reed.edgeEnds, Math.floor(E / 2));
+    if (2 * reed.edgeEnds > E)
+      issues.push({ sev: "error", kind: "reed-edge-total",
+        title: "边经总数超过总经数",
+        desc: `每侧边经 ${reed.edgeEnds} 根，两边共 ${2 * reed.edgeEnds} 根，但组织图只有 ${E} 根经纱。`,
+        locs: [{ kind: "reed-end", end: 0 }] });
+    edgeCount = 2 * edgeNeeds;
+  }
+  const bodyNeed = E - edgeCount;
+
+  // 先无限制地完整展开各段：得到理论所需筘齿与每齿“计划入经数”（原始序列值，
+  // 末齿截半只影响实穿，不影响“这一齿原本要穿几根”的超限判断）。
+  const ideal = { left: null, body: null, right: null };
+  if (reed.edgeOn && edgeUsable && edgeNeeds > 0)
+    ideal.left = reedExpandSection(edgeP.seq, edgeNeeds, -1, 0);
+  if (bodyUsable)
+    ideal.body = reedExpandSection(body.seq, bodyNeed, -1, edgeNeeds);
+  if (reed.edgeOn && edgeUsable && edgeNeeds > 0) {
+    const rightStart = edgeNeeds + (ideal.body ? ideal.body.endCount : 0);
+    ideal.right = reedExpandSection(edgeP.seq, edgeNeeds, -1, rightStart);
+  }
+  const idealDents = (ideal.left ? ideal.left.used : 0) +
+                     (ideal.body ? ideal.body.used : 0) +
+                     (ideal.right ? ideal.right.used : 0);
+  const overCapacity = available > 0 && idealDents > available;
+
+  // 第二遍：按幅宽内实际可用齿数展开（超限时会在末齿截停，仅用于展示对齐）。
+  const segResults = { left: null, body: null, right: null };
+  let cursor = 0;
+  const capAvail = (n) => unlimited ? -1 : Math.max(0, n);
+  if (reed.edgeOn && edgeUsable && edgeNeeds > 0) {
+    segResults.left = reedExpandSection(edgeP.seq, edgeNeeds, capAvail(available - cursor), 0);
+    cursor += segResults.left.used;
+  }
+  let bodyAvail = unlimited ? -1 : Math.max(0, available - cursor);
+  if (bodyUsable) {
+    const reserveRight = (reed.edgeOn && edgeUsable && edgeNeeds > 0 && !unlimited) ? 1 : 0;
+    segResults.body = reedExpandSection(body.seq, bodyNeed,
+      reserveRight ? Math.max(0, bodyAvail - reserveRight) : bodyAvail, edgeNeeds);
+    cursor += segResults.body.used;
+  }
+  if (reed.edgeOn && edgeUsable && edgeNeeds > 0) {
+    const rightStart = edgeNeeds + (segResults.body ? segResults.body.endCount : 0);
+    segResults.right = reedExpandSection(edgeP.seq, edgeNeeds, capAvail(available - cursor), rightStart);
+    cursor += segResults.right.used;
+  }
+
+  // 组装全局筘齿：left, body, right（dentsManual=0 且无筘号时 available=0，仍照常排）
+  const dents = [];
+  const endDent = new Int32Array(E).fill(-1);
+  const pushSeg = (seg, part) => {
+    if (!seg) return;
+    const seqArr = part === "body" ? body.seq : edgeP.seq;
+    for (const dd of seg.dents) {
+      const idx = dents.length;
+      const placedN = dd.e1 - dd.e0 + 1;
+      // 计划入经数取原序列该序号值（末齿因容量截停时仍按计划值判超限）
+      const planN = dd.v === 0 ? 0 : (seqArr ? seqArr[dd.sIdx % seqArr.length] : placedN);
+      dents.push({ idx, part, v: dd.v, planN, e0: dd.e0, e1: dd.e1, sIdx: dd.sIdx });
+      for (let e = dd.e0; e <= dd.e1; e++) if (e >= 0 && e < E) endDent[e] = idx;
+    }
+  };
+  pushSeg(segResults.left, "left");
+  pushSeg(segResults.body, "body");
+  pushSeg(segResults.right, "right");
+
+  const usedDents = dents.length;
+  const placedEnds = dents.reduce((n, d) => n + Math.max(0, d.e1 - d.e0 + 1), 0);
+
+  /* ---- 问题：筘齿数不足 / 超齿（按理论展开所需齿数判，不受截断影响） ---- */
+  if (overCapacity)
+    issues.push({ sev: "error", kind: "reed-dents-over",
+      title: `筘齿数不足：序列铺满需要 ${idealDents} 齿，幅宽内只有 ${available} 齿`,
+      desc: "入筘序列铺开所需筘齿数超过幅宽内筘齿数，请放宽幅宽、加大筘号或减小入经数。",
+      locs: [{ kind: "reed-dent", dent: available }] });
+
+  /* ---- 问题：段内停止（受筘齿上限约束排不完；不限齿数的预览模式不报） ---- */
+  if (!unlimited && overCapacity) for (const [part, nm] of [["left", "左边经"], ["body", "地经"], ["right", "右边经"]]) {
+    const seg = segResults[part];
+    if (seg && seg.stopped)
+      issues.push({ sev: "error", kind: "reed-seg-stop",
+        title: `${nm}在可用筘齿内排不完`,
+        desc: "序列中空齿过多或筘齿数不足，经纱无法全部穿入；工具不会自动补线，请手工调整序列或筘齿数。",
+        locs: [{ kind: "reed-dent", dent: Math.min(usedDents, Math.max(0, available - 1)) }] });
+  }
+
+  /* ---- 问题：边经根数与序列实穿不符 ---- */
+  if (reed.edgeOn && edgeUsable) {
+    for (const [part, seg] of [["left", segResults.left], ["right", segResults.right]]) {
+      if (seg && seg.endCount !== edgeNeeds)
+        issues.push({ sev: "error", kind: "reed-edge-mismatch",
+          title: `${part === "left" ? "左" : "右"}边经只穿入 ${seg.endCount} / ${edgeNeeds} 根`,
+          desc: "边经序列在幅宽内没有铺满规定的边经根数，且工具不会自动补线。",
+          locs: [{ kind: "reed-end",
+                   end: part === "left" ? Math.min(E - 1, seg.endCount) : E - 1 - Math.max(0, edgeNeeds - seg.endCount) }] });
+    }
+  }
+
+  /* ---- 问题：总经数不符（序列实穿总数 ≠ 组织图经纱数） ---- */
+  if (placedEnds !== E && bodyUsable && !(available > 0 && usedDents > available)) {
+    const diff = E - placedEnds;
+    issues.push({ sev: diff > 0 ? "warn" : "error", kind: "reed-total",
+      title: diff > 0
+        ? `总经数不符：还有 ${diff} 根经纱未入筘（组织图 ${E} 根 / 已穿 ${placedEnds} 根）`
+        : `总经数不符：序列需 ${placedEnds} 根，比组织图多 ${-diff} 根`,
+      desc: diff > 0
+        ? "当前序列按循环铺完筘齿后未覆盖全部经纱。工具不自动补线，请调整序列、筘齿数或边经规则。"
+        : "序列所需经纱多于组织图经纱，请缩短筘齿排布或修改序列。",
+      locs: [{ kind: "reed-end", end: diff > 0 ? placedEnds : E - 1 },
+             { kind: "reed-dent", dent: Math.min(usedDents - 1, Math.max(0, usedDents - 1)) }] });
+  }
+
+  /* ---- 问题：空齿位置错误（空齿只允许在段首/段尾——即段边界两侧；段内部空齿报错） ---- */
+  for (const d of dents) {
+    if (d.v !== 0) continue;
+    const seg = segResults[d.part];
+    const isBoundary = seg && (d.sIdx === 0 || d.sIdx === seg.dents.length - 1);
+    if (!isBoundary)
+      issues.push({ sev: "error", kind: "reed-empty",
+        title: `筘齿 ${d.idx + 1} 是空齿，且位于${partName(d.part)}段内部`,
+        desc: "空齿只允许出现在边经与地经的段边界；排布内部不应出现空齿，否则布面出现稀档。",
+        locs: [{ kind: "reed-dent", dent: d.idx },
+               { kind: "reed-end", end: clamp(d.idx === 0 ? 0 : (dents[d.idx - 1]?.e1 ?? 0), 0, E - 1) }] });
+  }
+
+  /* ---- 问题：每齿超限（地经 / 边经分开判；按计划入经数，末齿截停也判） ---- */
+  for (const d of dents) {
+    const n = d.planN;
+    const limit = d.part === "body" ? reed.maxPerDent : reed.edgeMax;
+    if (n > limit)
+      issues.push({ sev: "error",
+        kind: d.part === "body" ? "reed-over-body" : "reed-over-edge",
+        title: `筘齿 ${d.idx + 1} 入经 ${n} 根，超过${d.part === "body" ? "地经" : "边经"}每齿上限 ${limit}`,
+        desc: "超限筘齿会造成密档、磨损经纱，请改小序列中的入经数。",
+        locs: [{ kind: "reed-dent", dent: d.idx }, { kind: "reed-end", end: d.e0 }] });
+  }
+
+  /* ---- 穿综缺失：入筘经纱在组织图中未穿综（信息） ---- */
+  const unthreadedEnds = [];
+  for (let e = 0; e < E; e++) if (endDent[e] < 0) {
+    // 未入筘的经纱在总经数问题里报告；这里仅记录入了筘但未穿综的
+  }
+  for (const d of dents) {
+    for (let e = d.e0; e <= d.e1; e++) {
+      let threaded = false;
+      for (let s = 0; s < state.S; s++) if (state.threading.has(key(s, e))) { threaded = true; break; }
+      if (!threaded) unthreadedEnds.push(e);
+    }
+  }
+  if (unthreadedEnds.length)
+    issues.push({ sev: "info", kind: "reed-unthreaded",
+      title: `${unthreadedEnds.length} 根已入筘经纱在组织图中未穿综`,
+      desc: "穿筘对齐以经纱次序为准；未穿综的经纱可在「问题校对」页处理。",
+      locs: unthreadedEnds.slice(0, 10).map((e) => ({ kind: "reed-end", end: e, text: `经纱 ${e + 1}` })) });
+
+  /* ---- 色序错位：地经颜色循环边界落在某筘齿内部（不与齿边界对齐） ---- */
+  const colorPeriod = reedColorPeriod(E);
+  if (colorPeriod > 1 && segResults.body) {
+    // 以地经首根为相位基准，颜色分界位置（每 colorPeriod 根一处）
+    const bodyStart = edgeCount;
+    for (const d of dents) {
+      if (d.part !== "body" || d.e1 < d.e0) continue;
+      const rel0 = d.e0 - bodyStart, rel1 = d.e1 - bodyStart;
+      // 该齿跨越颜色周期边界：(floor(rel1/CP) > floor(rel0/CP))，且边界不在齿的起始处
+      if (rel0 >= 0 && Math.floor(rel1 / colorPeriod) > Math.floor(rel0 / colorPeriod) &&
+          rel0 % colorPeriod !== 0) {
+        issues.push({ sev: "warn", kind: "reed-color",
+          title: `筘齿 ${d.idx + 1} 内色序换色（经纱 ${d.e0 + 1}–${d.e1 + 1}）`,
+          desc: `地经颜色循环长 ${colorPeriod} 根，该筘齿跨越换色点，色条可能在齿内错位；可调整入筘序列使换色落在齿间。`,
+          locs: [{ kind: "reed-dent", dent: d.idx }, { kind: "reed-end", end: d.e1 }] });
+        break;
+      }
+    }
+    // 边经左右色不对称（提示）
+    if (reed.edgeOn && edgeNeeds > 0) {
+      let asym = 0;
+      for (let i = 0; i < edgeNeeds; i++)
+        if (warpColorAt(i) !== warpColorAt(E - 1 - i)) { asym = 1; break; }
+      if (asym)
+        issues.push({ sev: "info", kind: "reed-edge-color",
+          title: "左右边经配色不对称",
+          desc: "最外侧边经颜色从左到右不互为镜像，布边配色可能不一致。",
+          locs: [{ kind: "reed-end", end: 0 }, { kind: "reed-end", end: E - 1 }] });
+    }
+  }
+
+  /* ---- 统计（幅宽/分段按理论完整展开，截断时让超齿错误本身去提示） ---- */
+  const perCm = reedPerCm(reed);
+  const widthDents = unlimited ? idealDents || usedDents : Math.max(idealDents, usedDents);
+  const actualWidth = perCm > 0 ? widthDents / perCm : 0;
+  const overallDensity = actualWidth > 0 ? placedEnds / actualWidth : 0;
+  const segDensity = {};
+  for (const part of ["left", "body", "right"]) {
+    const seg = ideal[part];
+    const nDent = seg ? seg.dents.length : 0;
+    const nEnd = seg ? seg.endCount : 0;
+    segDensity[part] = { dents: nDent, ends: nEnd,
+      density: perCm > 0 && nDent ? nEnd / (nDent / perCm) : 0 };
+  }
+  const targetPerCm = reedDensityTargetPerCm(reed);
+  const densErr = targetPerCm > 0 && overallDensity > 0
+    ? (overallDensity - targetPerCm) / targetPerCm * 100 : null;
+  const bodyVals = bodyUsable ? body.seq : [];
+  const overBody = dents.filter((d) => d.part === "body" && d.planN > reed.maxPerDent).length;
+  const overEdge = dents.filter((d) => d.part !== "body" && d.planN > reed.edgeMax).length;
+
+  return {
+    reed, E, available, dents, usedDents, endDent, placedEnds,
+    edgeNeeds, edgeCount, bodyNeed,
+    bodySeqOk: body.ok, edgeSeqOk: edgeP.ok,
+    actualWidth, overallDensity, segDensity, densErr,
+    bodyMean: meanOf(bodyVals), bodyVals,
+    overBody, overEdge,
+    tailEmpty: Math.max(0, available - usedDents),
+    issues,
+  };
+}
+function partName(p) { return p === "left" ? "左边经" : p === "right" ? "右边经" : "地经"; }
+
+/* 地经颜色循环长度（1=全同色，不做色检） */
+function reedColorPeriod(E) {
+  const colors = [];
+  for (let e = 0; e < E; e++) colors.push(warpColorAt(e));
+  if (new Set(colors).size <= 1) return 1;
+  return detectPeriod(colors);
+}
+
+/* ============================================================
+   搜索：枚举入筘循环，选最接近目标经密、疏密变化最小的方案
+   ============================================================ */
+function searchReedCandidates() {
+  const reed = state.reed;
+  const L = computeReedLayout();
+  const available = L.available;
+  const edgeCount = L.edgeCount;
+  const bodyNeed = L.bodyNeed;
+  if (!(available > 0)) return { ok: false, error: "缺少有效的筘号与幅宽（或手工筘齿数），无法确定可用筘齿数。" };
+  if (bodyNeed <= 0) return { ok: false, error: "边经已占满全部经纱，没有地经可排。" };
+
+  // 每齿可取 0..cap 的循环（长度 1..6）；0 齿占空但不贡献经纱
+  const cap = Math.max(1, reed.maxPerDent | 0);
+  const seen = new Set();
+  const cands = [];
+  const MAX_NODES = 60000;
+  let nodes = 0;
+  function considerRaw(seq0) {
+    if (++nodes > MAX_NODES) return;
+    // 归一化：以最小元素旋转为起点，去重循环同构
+    let seq = seq0.slice();
+    let rot = 0;
+    for (let i = 1; i < seq.length; i++)
+      if (seq[i] < seq[rot]) rot = i;
+    seq = seq0.slice(rot).concat(seq0.slice(0, rot));
+    const sig = seq.join("-");
+    if (seen.has(sig)) return;
+    seen.add(sig);
+    // 纯 0 序列无意义
+    if (!seq.some((v) => v > 0)) return;
+
+    // 地经可用齿：总齿减去边经实际齿（用当前边经序列展开估算）
+    const reserve = estimateEdgeDents(L, seq);
+    const bodyAvail = available - reserve.edgeDents;
+    if (bodyAvail <= 0) { cands.push({ seq, error: "edge", reserve }); return; }
+
+    // 精确整除：循环均入 m，k 个循环恰好 bodyNeed 根且占 k*len 齿
+    const m = meanOf(seq);
+    let fit = null;
+    if (m > 0) {
+      const k = bodyNeed / (m * seq.length);
+      if (Math.abs(k - Math.round(k)) < 1e-9 && k >= 1) {
+        const nDent = Math.round(k) * seq.length;
+        if (nDent <= bodyAvail) fit = { nDent, exact: true };
+      }
+    }
+    // 回退：直接按 bodyAvail 齿循环截断，看能否恰好铺满（末齿不截半）
+    if (!fit) {
+      let ends = 0, nDent = 0, exact = true;
+      for (let i = 0; i < bodyAvail && ends < bodyNeed; i++, nDent++) {
+        const v = seq[i % seq.length];
+        if (ends + v > bodyNeed) { exact = false; break; }
+        ends += v;
+      }
+      if (ends === bodyNeed && exact && nDent > 0) fit = { nDent, exact: true };
+    }
+    if (!fit) return;
+
+    // 超限齿（地经）
+    const over = seq.filter((v) => v > cap).length;
+    const totalDents = reserve.edgeDents + fit.nDent;
+    const perCm = reedPerCm(reed);
+    const width = totalDents / perCm;
+    const density = width > 0 ? state.E / width : 0;
+    const target = reedDensityTargetPerCm(reed);
+    const densErr = target > 0 ? (density - target) / target * 100 : 0;
+    // 疏密变化：相邻齿入经差绝对值之和（按循环闭合）+ 极差
+    let jump = 0;
+    for (let i = 0; i < seq.length; i++) jump += Math.abs(seq[i] - seq[(i + 1) % seq.length]);
+    const spread = Math.max(...seq) - Math.min(...seq);
+    const nZero = seq.filter((v) => v === 0).length;
+    cands.push({ seq, nDent: fit.nDent, totalDents, width, density,
+      densErr, jump, spread, over, nZero, m });
+  }
+  // 按长度枚举全部组合
+  for (let len = 1; len <= 6 && nodes <= MAX_NODES; len++) {
+    const total = Math.pow(cap + 1, len);
+    for (let code = 0; code < total; code++) {
+      const seq = [];
+      let x = code;
+      for (let i = 0; i < len; i++) { seq.push(x % (cap + 1)); x = Math.floor(x / (cap + 1)); }
+      considerRaw(seq);
+      if (nodes > MAX_NODES) break;
+    }
+  }
+  // 还需保证边经序列本身可铺满（用其展开结果在候选中标记）
+  const valid = cands.filter((c) => !c.error);
+  if (!valid.length) return { ok: false, error: "在当前筘齿数、每齿上限与边经规则下没有能恰好铺满总经数的整数循环。可放宽上限或增大筘号/幅宽。" };
+  valid.sort((a, b) =>
+    (b.over === 0 ? 1 : 0) - (a.over === 0 ? 1 : 0) ||
+    Math.abs(a.densErr) - Math.abs(b.densErr) ||
+    a.jump - b.jump || a.spread - b.spread ||
+    a.seq.length - b.seq.length || a.nZero - b.nZero);
+  return { ok: true, cands: valid.slice(0, 6) };
+}
+/* 估计边经占齿数（左右各展开一次），供搜索预算 */
+function estimateEdgeDents(L, bodySeq) {
+  const reed = state.reed;
+  let edgeDents = 0;
+  if (reed.edgeOn && L.edgeNeeds > 0) {
+    const ep = parseReedSeq(reed.edgeSeq);
+    if (ep.ok) {
+      const one = reedExpandSection(ep.seq, L.edgeNeeds, L.available, 0);
+      edgeDents = 2 * one.used;
+    }
+  }
+  return { edgeDents };
+}
+
+/* ============================================================
+   穿筘 SVG（面板 + 打印共用，返回字符串）
+   ============================================================ */
+function reedDiagramSvg(L, px, forPrint) {
+  const { dents, E } = L;
+  const w = px, gap = forPrint ? 0.8 : 1.2;
+  const nDent = dents.length;
+  const tail = Math.max(0, L.available - nDent);
+  // 未入筘经纱按半齿宽逐根画在右侧
+  let unplacedCount = 0;
+  for (let e = 0; e < E; e++) if (L.endDent[e] < 0) unplacedCount++;
+  const widthUnits = Math.max(L.available, nDent) + unplacedCount * 0.5;
+  const W = Math.max(40, widthUnits * (w + gap) + 4);
+  // 行：齿号 5 / 颜色 9 / 综框 11 / 齿框 11 / 经号 7
+  const laneDentNo = 0, laneColor = 5.5, laneShaft = 15, laneBox = 25, laneEndNo = 38;
+  const H = laneEndNo + 7;
+  const xAt = (i) => 1 + i * (w + gap);
+  let s = `<svg id="reedSvg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+  if (!nDent) {
+    if (!unplacedCount)
+      return `<svg id="reedSvg" width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
+        <text class="reed-lane-txt" x="2" y="${H / 2}">当前参数下还没有可显示的筘齿（缺筘号/幅宽或序列无效）。</text></svg>`;
+    // 无筘齿时把全部未入筘经纱画出来（红框色条）
+    const ww = Math.max(W, E * (w / 2 + .6) + 4);
+    let t = `<svg id="reedSvg" width="${ww}" height="${H}" xmlns="http://www.w3.org/2000/svg">`;
+    for (let e = 0; e < E; e++) {
+      const x = 2 + e * (w / 2 + .6);
+      const col = state.colorPrint || !forPrint ? warpColorAt(e) : "#2b2b28";
+      t += `<rect class="reed-end reed-end-issue" data-end="${e}" x="${x}" y="${laneColor}"
+            width="${w / 2}" height="${laneEndNo - laneColor + 2}" fill="${col}"/>`;
+      if ((e + 1) % 5 === 0)
+        t += `<text class="reed-num clickable" data-end="${e}" x="${x + w / 4}" y="${laneEndNo + 5.4}">${e + 1}</text>`;
+    }
+    t += `<text class="reed-lane-txt" x="2" y="${laneColor - 1}">全部 ${E} 根经纱均未入筘（不自动补线）</text></svg>`;
+    return t;
+  }
+
+  // 段底色
+  const segRange = (part) => {
+    const a = dents.findIndex((d) => d.part === part);
+    let b = -1;
+    for (let i = nDent - 1; i >= 0; i--) if (dents[i].part === part) { b = i; break; }
+    return a < 0 ? null : [a, b];
+  };
+  for (const part of ["left", "right"]) {
+    const r = segRange(part);
+    if (r) s += `<rect class="reed-selvedge-bg" x="${xAt(r[0]) - gap / 2}" y="2"
+                 width="${(r[1] - r[0] + 1) * (w + gap) - gap / 2}" height="${H - 6}"/>`;
+  }
+
+  // 空尾齿（幅宽内未使用）
+  for (let i = 0; i < tail; i++) {
+    const x = xAt(nDent + i);
+    s += `<rect class="reed-dent-empty" x="${x}" y="${laneBox}" width="${w}" height="10"/>`;
+  }
+
+  // 筘齿框 + 经纱色条 + 综框号
+  const issueDents = new Set(), issueEnds = new Set();
+  for (const it of L.issues)
+    for (const loc of it.locs || []) {
+      if (loc.kind === "reed-dent") issueDents.add(loc.dent);
+      if (loc.kind === "reed-end") issueEnds.add(loc.end);
+    }
+  for (const d of dents) {
+    const x = xAt(d.idx);
+    const dentBad = issueDents.has(d.idx);
+    if (d.v === 0) {
+      s += `<rect class="reed-dent-empty ${dentBad ? "reed-dent-issue" : ""}" x="${x}" y="${laneBox}" width="${w}" height="10"/>`;
+      s += `<rect class="reed-dent-box ${dentBad ? "reed-dent-issue" : ""}" data-dent="${d.idx}" x="${x}" y="${laneBox}" width="${w}" height="10"/>`;
+    } else {
+      const n = d.e1 - d.e0 + 1;
+      const ew = w / n;
+      for (let e = d.e0; e <= d.e1; e++) {
+        const ex = x + (e - d.e0) * ew;
+        const col = state.colorPrint || !forPrint ? warpColorAt(e) : "#2b2b28";
+        const endBad = issueEnds.has(e);
+        s += `<rect class="reed-end ${endBad ? "reed-end-issue" : ""}" data-end="${e}"
+              x="${ex + .1}" y="${laneColor}" width="${ew - .2}" height="${laneEndNo - laneColor + 2}" fill="${col}"/>`;
+        // 综框号
+        let sh = -1;
+        for (let ss = 0; ss < state.S; ss++) if (state.threading.has(key(ss, e))) { sh = ss + 1; break; }
+        if (sh > 0)
+          s += `<text class="reed-txt" x="${ex + ew / 2}" y="${laneShaft + 2.6}">${sh}</text>`;
+      }
+      s += `<rect class="reed-dent-box ${dentBad ? "reed-dent-issue" : ""}" data-dent="${d.idx}"
+            x="${x}" y="${laneBox}" width="${w}" height="10"/>`;
+    }
+    // 齿号
+    const major = (d.idx + 1) % 5 === 0;
+    s += `<text class="reed-num ${major ? "major" : ""} ${d.part !== "body" ? "edge-num clickable" : "clickable"}"
+          data-dent="${d.idx}" x="${x + w / 2}" y="${laneDentNo + 3.6}">${d.idx + 1}</text>`;
+    // 经纱序号（每 5 根在色条下标一次）
+    if (d.e1 >= d.e0) {
+      const nEnd = d.e1 - d.e0 + 1;
+      const ew2 = w / nEnd;
+      for (let e = d.e0; e <= d.e1; e++) {
+        if ((e + 1) % 5 !== 0) continue;
+        s += `<text class="reed-num clickable" data-end="${e}"
+              x="${x + (e - d.e0) * ew2 + ew2 / 2}" y="${laneEndNo + 5.4}">${e + 1}</text>`;
+      }
+    }
+  }
+  // 未入筘经纱：逐根画在排布右侧（红虚框色条，仍可点击定位到穿综格）
+  const unplaced = [];
+  for (let e = 0; e < E; e++) if (endDent[e] < 0) unplaced.push(e);
+  if (unplaced.length) {
+    const baseX = xAt(Math.min(Math.max(nDent, 0), widthUnits - 1)) + w + gap;
+    const ew = Math.max(1.2, w / 2);
+    unplaced.forEach((e, i) => {
+      const x = baseX + i * ew;
+      const col = state.colorPrint || !forPrint ? warpColorAt(e) : "#2b2b28";
+      s += `<rect class="reed-end reed-end-issue" data-end="${e}"
+            x="${x}" y="${laneColor}" width="${ew - .2}" height="${laneEndNo - laneColor + 2}"
+            fill="${col}"/>`;
+      s += `<text class="reed-num clickable" data-end="${e}"
+            x="${x + ew / 2 - .1}" y="${laneEndNo + 5.4}">${e + 1}</text>`;
+    });
+    s += `<text class="reed-lane-txt" x="${baseX}" y="${laneColor - 1}">未入筘 ${unplaced.length} 根（不自动补线）</text>`;
+  }
+  s += `</svg>`;
+  return s;
+}
+
+/* ============================================================
+   面板渲染
+   ============================================================ */
+let reedLayoutCache = null;
+function refreshReed() {
+  if (!state.reed) state.reed = defaultReed();
+  reedLayoutCache = computeReedLayout();
+  renderReedStatus(reedLayoutCache);
+  renderReedStats(reedLayoutCache);
+  renderReedDiagram(reedLayoutCache);
+  renderReedIssues(reedLayoutCache);
+}
+let reedTimer = null;
+function scheduleReedRefresh() {
+  clearTimeout(reedTimer);
+  reedTimer = setTimeout(() => { if ($("#paneReed")) refreshReed(); }, 180);
+}
+function renderReedStatus(L) {
+  const el = $("#reedStatus");
+  if (!el) return;
+  const nErr = L.issues.filter((i) => i.sev === "error").length;
+  const nWarn = L.issues.filter((i) => i.sev === "warn").length;
+  el.className = "reed-status " + L.reed.status;
+  let note = "";
+  if (L.reed.status === "draft") note = `参数可继续修改（${nErr} 错误 / ${nWarn} 警告）`;
+  if (L.reed.status === "checked") note = "已通过校验；修改任一参数将回到草拟";
+  if (L.reed.status === "adopted") note = "已采用，随撤销/草稿/项目版本保存 · " + fmtTime(L.reed.adoptedAt);
+  el.innerHTML = `状态：${REED_LS_STATUS[L.reed.status]} <span class="reed-status-note">${note}</span>`;
+  const printBtn = $("#btnReedPrint");
+  if (printBtn) {
+    printBtn.disabled = L.reed.status === "draft" || nErr > 0;
+    printBtn.title = printBtn.disabled ? "只有已校验/已采用且无错误的方案才能打印穿经单" : "";
+  }
+  const adoptBtn = $("#btnReedAdopt");
+  if (adoptBtn) adoptBtn.disabled = nErr > 0;
+}
+function fmtDensity(v, reed) {
+  if (!v) return "—";
+  return reedFromCm(v, reed).toFixed(2);
+}
+function renderReedStats(L) {
+  const el = $("#reedStats");
+  if (!el) return;
+  const r = L.reed;
+  const unitTxt = r.unit === "in" ? "英寸" : "厘米";
+  const tgt = reedDensityTargetPerCm(r);
+  const errCls = L.densErr === null ? "" : Math.abs(L.densErr) <= 3 ? "ok" : Math.abs(L.densErr) <= 8 ? "warn" : "bad";
+  const densTxt = L.overallDensity
+    ? `${fmtDensity(L.overallDensity, r)} 根/${unitTxt}` +
+      (L.densErr !== null ? ` <span class="small">(${L.densErr >= 0 ? "+" : ""}${L.densErr.toFixed(1)}%)</span>` : "")
+    : "—";
+  const segLine = (nm, sd) =>
+    `${nm} ${sd.ends}根/${sd.dents}齿 · ` +
+    (sd.density ? `${fmtDensity(sd.density, r)} 根/${unitTxt}` : "—");
+  const overCls = L.overBody + L.overEdge ? "bad" : "ok";
+  el.innerHTML = `
+    <div class="reed-stat">总经数 <b>${L.E}</b> ｜ 已入筘 <b class="${L.placedEnds === L.E ? "ok" : "bad"}">${L.placedEnds}</b></div>
+    <div class="reed-stat">幅宽内筘齿 <b>${L.available || "—"}</b> ｜ 实际占用 <b>${L.usedDents}</b>${L.tailEmpty ? ` <span class="small">余 ${L.tailEmpty} 空齿</span>` : ""}</div>
+    <div class="reed-stat">实际幅宽 <b>${L.actualWidth ? reedFromCm(L.actualWidth, r).toFixed(2) + " " + unitTxt : "—"}</b>${r.width ? ` <span class="small">目标 ${r.width}</span>` : ""}</div>
+    <div class="reed-stat ${errCls}">整体经密 <b>${densTxt}</b>${tgt ? ` <span class="small">目标 ${r.targetDensity}</span>` : ""}</div>
+    <div class="reed-stat">${segLine("左边", L.segDensity.left)}</div>
+    <div class="reed-stat">${segLine("地经", L.segDensity.body)}</div>
+    <div class="reed-stat">${segLine("右边", L.segDensity.right)}</div>
+    <div class="reed-stat ${overCls}">超限筘齿 <b>${L.overBody + L.overEdge}</b>
+      <span class="small">（地经 ${L.overBody} / 边 ${L.overEdge}）</span></div>`;
+}
+function renderReedDiagram(L) {
+  const box = $("#reedDiagram");
+  if (!box) return;
+  box.innerHTML = reedDiagramSvg(L, 6, false);
+}
+function renderReedIssues(L) {
+  const ul = $("#reedIssueList");
+  if (!ul) return;
+  ul.innerHTML = "";
+  if (!L.issues.length) {
+    ul.innerHTML = `<li class="issue-item sev-info" style="cursor:default;border-left-color:var(--green)">
+      <div class="ii-title">✓ 未发现穿筘问题</div></li>`;
+    return;
+  }
+  L.issues.forEach((it, i) => {
+    const li = document.createElement("li");
+    li.className = `issue-item sev-${it.sev}`;
+    const sevName = it.sev === "error" ? "错误" : it.sev === "warn" ? "警告" : "提示";
+    let html = `<div class="ii-title">${it.title} <span class="small">[${sevName}]</span></div>
+      <div class="ii-desc">${it.desc}</div>`;
+    if (it.locs && it.locs.length) {
+      const txt = it.locs.slice(0, 6).map((lc) => {
+        if (lc.text) return lc.text;
+        if (lc.kind === "reed-dent") return `筘齿 ${Math.min(lc.dent + 1, L.usedDents || 1)}`;
+        return `经纱 ${lc.end + 1}`;
+      }).join("、");
+      html += `<div class="ii-locs">📍 ${txt}</div>`;
+    }
+    li.innerHTML = html;
+    li.addEventListener("click", () => locateReedIssue(it));
+    ul.appendChild(li);
+  });
+}
+
+/* 点击问题：定位具体经纱（穿综格闪烁）与筘齿（穿筘图闪烁） */
+function locateReedIssue(it) {
+  const dent = (it.locs || []).find((l) => l.kind === "reed-dent");
+  const end = (it.locs || []).find((l) => l.kind === "reed-end");
+  if (dent) flashReedDent(dent.dent);
+  if (end) {
+    flashReedEnd(end.end);
+    flashGridCell("threading", Math.max(0, endShaftOf(end.end)), end.end);
+  }
+}
+function flashReedDent(idx) {
+  const svg = $("#reedSvg");
+  if (!svg) return;
+  const els = svg.querySelectorAll(`[data-dent="${idx}"]`);
+  els.forEach((e) => { e.classList.add("reed-flash"); setTimeout(() => e.classList.remove("reed-flash"), 1700); });
+  const box = $("#reedDiagram");
+  if (els.length && box) scrollElHoriz(els[els.length - 1], box);
+}
+function flashReedEnd(e) {
+  const svg = $("#reedSvg");
+  if (!svg) return;
+  const el = svg.querySelector(`[data-end="${e}"]`);
+  if (el) {
+    el.classList.add("reed-flash");
+    setTimeout(() => el.classList.remove("reed-flash"), 1700);
+    const box = $("#reedDiagram");
+    if (box) scrollElHoriz(el, box);
+  }
+}
+function scrollElHoriz(el, container) {
+  const b = el.getBoundingClientRect && el.getBoundingClientRect();
+  const cb = container.getBoundingClientRect();
+  if (b && (b.left < cb.left || b.right > cb.right))
+    container.scrollLeft += b.left - cb.left - 30;
+}
+
+/* SVG 委托：点色条→穿综格；点齿号/齿框→闪烁该齿 */
+function bindReedDiagramEvents() {
+  const box = $("#reedDiagram");
+  if (!box || box.dataset.bound) return;
+  box.dataset.bound = "1";
+  box.addEventListener("click", (ev) => {
+    const endEl = ev.target.closest("[data-end]");
+    if (endEl) {
+      const e = +endEl.dataset.end;
+      flashGridCell("threading", Math.max(0, endShaftOf(e)), e);
+      $("#coordText").textContent =
+        `穿筘：经纱 ${e + 1} → 筘齿 ${reedLayoutCache.endDent[e] + 1} · 综框 ${endShaftOf(e) + 1}`;
+      return;
+    }
+    const dentEl = ev.target.closest("[data-dent]");
+    if (dentEl) flashReedDent(+dentEl.dataset.dent);
+  });
+}
+
+/* ============================================================
+   表单 ↔ state.reed
+   ============================================================ */
+function syncReedForm() {
+  const r = state.reed || (state.reed = defaultReed());
+  $("#reedReedNo").value = r.reedNo || "";
+  $("#reedTargetDensity").value = r.targetDensity || "";
+  $("#reedWidth").value = r.width || "";
+  $("#reedDents").value = r.dentsManual || "";
+  $("#reedMaxDent").value = r.maxPerDent;
+  $("#reedSequence").value = r.seq;
+  $("#reedEdgeOn").checked = !!r.edgeOn;
+  $("#reedEdgeEnds").value = r.edgeEnds;
+  $("#reedEdgeMax").value = r.edgeMax;
+  $("#reedEdgeSeq").value = r.edgeSeq;
+  $("#reedUnit").value = r.unit;
+  updateReedUnitLabels();
+  refreshReed();
+}
+function updateReedUnitLabels() {
+  const u = state.reed.unit === "in" ? "英寸" : "厘米";
+  $("#reedDensityUnit").textContent = u;
+  $("#reedWidthUnit").textContent = u;
+}
+function readReedForm({ keepStatus } = {}) {
+  const r = state.reed;
+  r.reedNo = Math.max(0, +$("#reedReedNo").value || 0);
+  r.targetDensity = Math.max(0, +$("#reedTargetDensity").value || 0);
+  r.width = Math.max(0, +$("#reedWidth").value || 0);
+  r.dentsManual = Math.max(0, +$("#reedDents").value || 0);
+  r.maxPerDent = clamp(+$("#reedMaxDent").value || 1, 1, 10);
+  r.seq = $("#reedSequence").value.trim() || "0";
+  r.edgeOn = $("#reedEdgeOn").checked;
+  r.edgeEnds = Math.max(0, +$("#reedEdgeEnds").value || 0);
+  r.edgeMax = clamp(+$("#reedEdgeMax").value || 1, 1, 10);
+  r.edgeSeq = $("#reedEdgeSeq").value.trim() || "0";
+  if (!keepStatus) r.status = "draft";
+  refreshReed();
+}
+function commitReedEdit() {
+  readReedForm();
+  pushHistory();
+}
+
+/* 单位切换：在厘米/英寸间换算物理量，保持方案不变 */
+function switchReedUnit(to) {
+  const r = state.reed;
+  if (r.unit === to) return;
+  if (to === "in") {
+    r.reedNo = r.reedNo * CM_PER_IN;
+    r.targetDensity = r.targetDensity * CM_PER_IN;
+    r.width = r.width * CM_PER_IN;
+  } else {
+    r.reedNo = r.reedNo / CM_PER_IN;
+    r.targetDensity = r.targetDensity / CM_PER_IN;
+    r.width = r.width / CM_PER_IN;
+  }
+  r.unit = to;
+  r.status = "draft";
+  const round2 = (v) => Math.round(v * 100) / 100;
+  $("#reedReedNo").value = round2(r.reedNo) || "";
+  $("#reedTargetDensity").value = round2(r.targetDensity) || "";
+  $("#reedWidth").value = round2(r.width) || "";
+  updateReedUnitLabels();
+  refreshReed();
+  pushHistory();
+}
+
+/* ---------------- 校验 / 采用 ---------------- */
+function reedCheck() {
+  readReedForm({ keepStatus: true });
+  const L = reedLayoutCache;
+  const nErr = L.issues.filter((i) => i.sev === "error").length;
+  if (nErr) { toast(`仍有 ${nErr} 个错误，不能通过校验（见下方问题列表）`, 2800); return; }
+  state.reed.status = "checked";
+  refreshReed();
+  pushHistory();
+  toast("已校验：无错误，可采用或打印穿经单");
+}
+function reedAdopt() {
+  readReedForm({ keepStatus: true });
+  const L = reedLayoutCache;
+  if (L.issues.some((i) => i.sev === "error")) { toast("仍有错误，不能采用", 2600); return; }
+  if (!confirm("采用当前穿筘方案？\n组织图（穿综/踏序/颜色）保持不变；采用结果随撤销、草稿与项目版本保存。")) return;
+  state.reed.status = "adopted";
+  state.reed.adoptedAt = Date.now();
+  refreshReed();
+  pushHistory();
+  toast("已采用穿筘方案");
+}
+
+/* ============================================================
+   搜索弹窗：并排比较候选
+   ============================================================ */
+function openReedSearch() {
+  readReedForm({ keepStatus: true });
+  const r = searchReedCandidates();
+  const body = document.createElement("div");
+  if (!r.ok) {
+    body.innerHTML = `<div class="conv-warn">${escapeHtml(r.error)}</div>`;
+    openModal("🔍 搜索入筘方案", body, [{ label: "关闭", action: closeModal }], true);
+    $("#modalBox").classList.add("wide");
+    return;
+  }
+  const unitTxt = state.reed.unit === "in" ? "英寸" : "厘米";
+  body.innerHTML = `<p class="small muted" style="margin-top:0">
+    候选均能恰好铺满 ${state.E} 根经纱；按 <b>超限 → 经密误差 → 疏密变化（相邻齿差/极差）</b> 排序。
+    点一张卡片即把该序列填入表单（状态回到草拟，需重新校验/采用）。</p><div id="reedCandList"></div>`;
+  openModal("🔍 搜索入筘方案（最接近目标经密、疏密变化最小）", body,
+    [{ label: "关闭", action: closeModal }], true);
+  $("#modalBox").classList.add("xwide");
+  const list = body.querySelector("#reedCandList");
+  r.cands.forEach((c, i) => list.appendChild(reedCandCard(c, i, unitTxt)));
+}
+function reedCandCard(c, i, unitTxt) {
+  const card = document.createElement("div");
+  card.className = "reed-cand" + (i === 0 ? " sel" : "");
+  const errCls = Math.abs(c.densErr) <= 3 ? "ok" : Math.abs(c.densErr) <= 8 ? "warn" : "bad";
+  const toUnit = (v) => state.reed.unit === "in" ? v * CM_PER_IN : v;
+  card.innerHTML = `
+    <div class="reed-cand-head">
+      <b>候选 ${i + 1}：${c.seq.join("-")}</b>
+      <span>循环 ${c.seq.length} 齿 · 均入 ${c.m.toFixed(2)}</span>
+      <span>幅宽 <b>${toUnit(c.width).toFixed(2)} ${unitTxt}</b></span>
+      <span class="${errCls}">经密 ${toUnit(c.density).toFixed(2)} 根/${unitTxt}
+        （${c.densErr >= 0 ? "+" : ""}${c.densErr.toFixed(1)}%）</span>
+      <span class="${c.over ? "bad" : "ok"}">超限齿 ${c.over}</span>
+      <span class="small muted">疏密变化 ${c.jump} / 极差 ${c.spread}</span>
+    </div>`;
+  // 迷你齿条
+  const px = 10;
+  let s = `<svg width="${Math.min(c.totalDents * px, 900)}" height="16"
+             viewBox="0 0 ${c.totalDents} 16" preserveAspectRatio="none"
+             style="max-width:100%">`;
+  for (let i = 0; i < c.totalDents; i++) {
+    const v = i < c.nDent ? c.seq[i % c.seq.length] : 0;
+    const h = 2 + v * 3;
+    const fill = v > state.reed.maxPerDent ? "#c0392b" : v === 0 ? "#d6d2c6" : "#8a5a2b";
+    s += `<rect x="${i}" y="${14 - h}" width=".9" height="${h}" fill="${fill}"/>`;
+  }
+  s += `</svg>`;
+  card.insertAdjacentHTML("beforeend", s);
+  card.addEventListener("click", () => {
+    $("#reedSequence").value = c.seq.join("-");
+    readReedForm();
+    pushHistory();
+    closeModal();
+    toast(`已填入序列 ${c.seq.join("-")}，请校验后采用`);
+  });
+  return card;
+}
+
+/* ============================================================
+   打印穿经单（带穿综、穿筘、颜色；仅已校验/已采用）
+   ============================================================ */
+function printReedSheet() {
+  readReedForm({ keepStatus: true });
+  const L = computeReedLayout();
+  if (state.reed.status === "draft") { toast("草拟方案不能打印，请先校验", 2600); return; }
+  if (L.issues.some((i) => i.sev === "error")) { toast("仍有错误，不能打印", 2600); return; }
+
+  const r = state.reed;
+  const unitTxt = r.unit === "in" ? "英寸" : "厘米";
+  const area = $("#printArea");
+  const px = 6;
+  const svg = reedDiagramSvg(L, px, true);
+  // 缩放整图到打印宽
+  let diagramHtml = "";
+  {
+    const widthUnits = Math.max(L.available, L.usedDents);
+    const svgW = widthUnits * (px + 0.8) + 2;
+    diagramHtml = `<div class="print-reed-svg-wrap" style="overflow:hidden">
+      <div style="transform-origin:0 0; transform:scale(${Math.min(1, 760 / svgW)})">${svg}</div></div>`;
+  }
+  const seg = L.segDensity;
+  const widthShown = reedFromCm(L.actualWidth, r);
+  let html = `<div class="print-sheet">
+    <div class="print-reed-head">
+      <b>${escapeHtml($("#projectName").value)} · 穿经单（穿综 / 穿筘 / 颜色）</b>
+      <div class="print-reed-meta">
+        状态：${REED_LS_STATUS[r.status]} ｜ 总经 ${L.E} 根 ｜
+        筘号 ${round3(r.reedNo)} 齿/${unitTxt} ｜ 成品幅宽 ${round3(r.width)} ${unitTxt}（实际 ${round3(widthShown)} ${unitTxt}）｜
+        筘齿 ${L.usedDents}/${L.available || "—"} ｜
+        入筘序列 ${escapeHtml(r.seq)}${r.edgeOn ? ` ｜ 边经每侧 ${r.edgeEnds} 根、序列 ${escapeHtml(r.edgeSeq)}` : ""}
+      </div>
+      <div class="print-reed-meta">
+        整体经密 ${fmtDensity(L.overallDensity, r)} 根/${unitTxt}（目标 ${r.targetDensity || "—"}）｜
+        左边 ${seg.left.ends}根/${seg.left.dents}齿 ｜ 地经 ${seg.body.ends}根/${seg.body.dents}齿 ｜ 右边 ${seg.right.ends}根/${seg.right.dents}齿 ｜
+        打印日期 ${new Date().toLocaleDateString("zh-CN")}
+      </div>
+    </div>
+    ${diagramHtml}
+  </div>`;
+
+  // 逐根表：经号、颜色、综框、筘齿号、齿内位次、段、齿入数
+  const rowsPerSheet = 46;
+  const endDent = L.endDent;
+  const dentByEnd = [];
+  for (const d of L.dents)
+    for (let e = d.e0; e <= d.e1; e++) dentByEnd[e] = d;
+  let sheetNo = 0;
+  for (let start = 0; start < L.E; start += rowsPerSheet) {
+    sheetNo++;
+    let t = `<div class="print-sheet"><table class="print-threading">
+      <thead><tr>
+        <th style="width:12%">经纱号</th><th style="width:12%">颜色</th>
+        <th style="width:12%">综框</th><th style="width:14%">筘齿号</th>
+        <th style="width:14%">齿内第几位</th><th style="width:12%">该齿入经</th>
+        <th>段</th>
+      </tr></thead><tbody>`;
+    for (let e = start; e < Math.min(L.E, start + rowsPerSheet); e++) {
+      const d = dentByEnd[e];
+      let sh = "—";
+      for (let ss = 0; ss < state.S; ss++) if (state.threading.has(key(ss, e))) { sh = ss + 1; break; }
+      t += `<tr>
+        <td>${e + 1}</td>
+        <td><span class="print-swatch" style="background:${warpColorAt(e)}"></span> ${warpColorAt(e)}</td>
+        <td>${sh}</td>
+        <td>${d ? d.idx + 1 : "未入筘"}</td>
+        <td>${d ? e - d.e0 + 1 : "—"}</td>
+        <td>${d ? (d.v || 0) : "—"}</td>
+        <td>${d ? partName(d.part) : "—"}</td>
+      </tr>`;
+    }
+    t += `</tbody></table>`;
+    t += `<div class="print-reed-meta" style="margin-top:4px">第 ${sheetNo} 页 ｜ 经纱 ${start + 1}–${Math.min(L.E, start + rowsPerSheet)}</div>`;
+    t += `</div>`;
+    html += t;
+  }
+  area.innerHTML = html;
+  window.print();
+}
+function round3(v) { return (Math.round((v || 0) * 100) / 100).toFixed(2); }
+
+/* ============================================================
+   穿筘模块事件绑定（init 调用一次）
+   ============================================================ */
+function initReed() {
+  state.reed = normalizeReed(state.reed);
+  syncReedForm();
+  bindReedDiagramEvents();
+
+  $("#btnReedSearch").addEventListener("click", openReedSearch);
+  $("#btnReedCheck").addEventListener("click", reedCheck);
+  $("#btnReedAdopt").addEventListener("click", reedAdopt);
+  $("#btnReedPrint").addEventListener("click", printReedSheet);
+
+  // 参数改动：即时重算（不入栈），失焦/回车时提交历史
+  const liveIds = ["reedReedNo", "reedTargetDensity", "reedWidth", "reedDents",
+                   "reedMaxDent", "reedSequence", "reedEdgeEnds", "reedEdgeMax", "reedEdgeSeq"];
+  for (const id of liveIds) {
+    const el = $("#" + id);
+    el.addEventListener("input", () => { readReedForm(); scheduleSave(); });
+    el.addEventListener("change", commitReedEdit);
+    el.addEventListener("keydown", (ev) => { if (ev.key === "Enter") commitReedEdit(); });
+  }
+  $("#reedEdgeOn").addEventListener("change", () => { readReedForm(); commitReedEdit(); });
+  $("#reedUnit").addEventListener("change", (ev) => switchReedUnit(ev.target.value));
+}
+
+/* 组织图经纱相关变化（换示例、导入 WIF、改经纱数、镜像等）后，
+   旧穿筘方案不再与当前经纱次序相符，状态回到草拟（参数保留，不删除） */
+function invalidateReedOnWarpChange() {
+  if (state.reed && state.reed.status !== "draft") {
+    state.reed.status = "draft";
+    if ($("#reedStatus")) refreshReed();
+  }
+}
 function init() {
   // 顶栏
   $("#btnUndo").addEventListener("click", undo);
@@ -3708,6 +4706,7 @@ function init() {
   });
 
   attachDrawdownHover();
+  initReed();
 
   // 恢复草稿或载入默认示例
   let restored = false;
@@ -3725,6 +4724,7 @@ function init() {
         state.liftplan = new Set(d.liftplan || []);
         state.warpColors = d.warpColors || [];
         state.weftColors = d.weftColors || [];
+        state.reed = normalizeReed(d.reed || null);
         $("#projectName").value = d.name || "未命名项目";
         restored = true;
       }
