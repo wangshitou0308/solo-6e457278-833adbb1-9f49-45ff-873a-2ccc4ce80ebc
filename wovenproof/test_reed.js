@@ -148,15 +148,18 @@ L = computeReedLayout();
 check("全未穿综：报 reed-unthreaded 提示", kinds(L).includes("reed-unthreaded"), kinds(L));
 state.threading = savedThreading;
 
-/* ---- 用例 12：英寸单位换算 ---- */
+/* ---- 用例 12：英寸单位（20 齿/英寸 × 1 英寸 = 20 齿；密度按根/英寸） ---- */
 state.reed.edgeOn = false;
 state.reed.unit = "in";
-state.reed.reedNo = 20;      // 20齿/英寸 ≈ 7.874齿/cm
-state.reed.width = 1;       // 1 英寸
+state.reed.reedNo = 20;      // 20齿/英寸
+state.reed.width = 1;        // 1 英寸 → 20 齿
 state.reed.targetDensity = 40;
 state.reed.dentsManual = 0;
 L = computeReedLayout();
-check("英寸：可用齿=round(7.874)=8", L.available === 8, L.available);
+check("英寸：可用齿=20×1=20", L.available === 20, L.available);
+// 2-2 穿24根需12齿，实际幅宽 12/20=0.6 英寸，密度 24/0.6=40 根/英寸
+check("英寸：实际幅宽0.6英寸", Math.abs(L.actualWidth - 0.6) < 1e-9, L.actualWidth);
+check("英寸：整体经密40根/英寸", Math.abs(L.overallDensity - 40) < 1e-9, L.overallDensity);
 state.reed.unit = "cm"; state.reed.reedNo = 10; state.reed.width = 2.4; state.reed.targetDensity = 10;
 
 /* ---- 用例 13：搜索候选 ---- */

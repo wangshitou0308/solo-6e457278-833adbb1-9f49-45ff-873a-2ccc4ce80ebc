@@ -3635,11 +3635,10 @@ function normalizeReed(r) {
   return d;
 }
 const CM_PER_IN = 2.54;
-function reedPerCm(reed) { return reed.unit === "in" ? reed.reedNo / CM_PER_IN : reed.reedNo; }
-function reedDensityTargetPerCm(reed) {
-  return reed.unit === "in" ? reed.targetDensity / CM_PER_IN : reed.targetDensity;
-}
-function reedFromCm(v, reed) { return reed.unit === "in" ? v * CM_PER_IN : v; }
+/* 所有幅宽/经密计算一律在“当前所选单位”下进行，不做厘米中转，避免量纲错乱：
+   筘号=每单位筘齿数，故 筘齿数=筘号×幅宽（同单位），经密=根数/幅宽（同单位）。 */
+function reedPitch(reed) { return reed.reedNo; }                 // 每单位长度筘齿数
+function reedTargetDensity(reed) { return reed.targetDensity; }   // 目标经密（根/单位长度）
 /* 解析 "2-2-3" / "2,2,3"；返回 {ok, seq, bad}，允许 0（空齿） */
 function parseReedSeq(text) {
   const bad = [];
@@ -3653,9 +3652,9 @@ function parseReedSeq(text) {
 }
 function reedAvailableDents(reed) {
   if (reed.dentsManual > 0) return Math.round(reed.dentsManual);
-  const perCm = reedPerCm(reed);
-  if (!(perCm > 0) || !(reed.width > 0)) return 0;
-  return Math.max(0, Math.round(perCm * reed.width));
+  const pitch = reedPitch(reed);
+  if (!(pitch > 0) || !(reed.width > 0)) return 0;
+  return Math.max(0, Math.round(pitch * reed.width));
 }
 function meanOf(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0; }
 
@@ -3890,10 +3889,10 @@ function computeReedLayout() {
     }
   }
 
-  /* ---- 统计（幅宽/分段按理论完整展开，截断时让超齿错误本身去提示） ---- */
-  const perCm = reedPerCm(reed);
+  /* ---- 统计（幅宽/经密均在当前单位下；幅宽按理论完整展开的筘齿数换算） ---- */
+  const pitch = reedPitch(reed);
   const widthDents = unlimited ? idealDents || usedDents : Math.max(idealDents, usedDents);
-  const actualWidth = perCm > 0 ? widthDents / perCm : 0;
+  const actualWidth = pitch > 0 ? widthDents / pitch : 0;
   const overallDensity = actualWidth > 0 ? placedEnds / actualWidth : 0;
   const segDensity = {};
   for (const part of ["left", "body", "right"]) {
@@ -3901,11 +3900,11 @@ function computeReedLayout() {
     const nDent = seg ? seg.dents.length : 0;
     const nEnd = seg ? seg.endCount : 0;
     segDensity[part] = { dents: nDent, ends: nEnd,
-      density: perCm > 0 && nDent ? nEnd / (nDent / perCm) : 0 };
+      density: pitch > 0 && nDent ? nEnd / (nDent / pitch) : 0 };
   }
-  const targetPerCm = reedDensityTargetPerCm(reed);
-  const densErr = targetPerCm > 0 && overallDensity > 0
-    ? (overallDensity - targetPerCm) / targetPerCm * 100 : null;
+  const target = reedTargetDensity(reed);
+  const densErr = target > 0 && overallDensity > 0
+    ? (overallDensity - target) / target * 100 : null;
   const bodyVals = bodyUsable ? body.seq : [];
   const overBody = dents.filter((d) => d.part === "body" && d.planN > reed.maxPerDent).length;
   const overEdge = dents.filter((d) => d.part !== "body" && d.planN > reed.edgeMax).length;
@@ -3993,10 +3992,10 @@ function searchReedCandidates() {
     // 超限齿（地经）
     const over = seq.filter((v) => v > cap).length;
     const totalDents = reserve.edgeDents + fit.nDent;
-    const perCm = reedPerCm(reed);
-    const width = totalDents / perCm;
+    const pitch = reedPitch(reed);
+    const width = totalDents / pitch;          // 同单位幅宽
     const density = width > 0 ? state.E / width : 0;
-    const target = reedDensityTargetPerCm(reed);
+    const target = reedTargetDensity(reed);
     const densErr = target > 0 ? (density - target) / target * 100 : 0;
     // 疏密变化：相邻齿入经差绝对值之和（按循环闭合）+ 极差
     let jump = 0;
@@ -4143,11 +4142,11 @@ function reedDiagramSvg(L, px, forPrint) {
       }
     }
   }
-  // 未入筘经纱：逐根画在排布右侧（红虚框色条，仍可点击定位到穿综格）
+  // 未入筘经纱：逐根画在全部筘齿（含尾空齿）之后，红框色条仍可点击定位到穿综格
   const unplaced = [];
-  for (let e = 0; e < E; e++) if (endDent[e] < 0) unplaced.push(e);
+  for (let e = 0; e < E; e++) if (L.endDent[e] < 0) unplaced.push(e);
   if (unplaced.length) {
-    const baseX = xAt(Math.min(Math.max(nDent, 0), widthUnits - 1)) + w + gap;
+    const baseX = xAt(Math.max(nDent, L.available)) + gap;
     const ew = Math.max(1.2, w / 2);
     unplaced.forEach((e, i) => {
       const x = baseX + i * ew;
@@ -4200,29 +4199,29 @@ function renderReedStatus(L) {
   const adoptBtn = $("#btnReedAdopt");
   if (adoptBtn) adoptBtn.disabled = nErr > 0;
 }
-function fmtDensity(v, reed) {
+function fmtDensity(v) {
   if (!v) return "—";
-  return reedFromCm(v, reed).toFixed(2);
+  return v.toFixed(2);
 }
 function renderReedStats(L) {
   const el = $("#reedStats");
   if (!el) return;
   const r = L.reed;
   const unitTxt = r.unit === "in" ? "英寸" : "厘米";
-  const tgt = reedDensityTargetPerCm(r);
+  const tgt = reedTargetDensity(r);
   const errCls = L.densErr === null ? "" : Math.abs(L.densErr) <= 3 ? "ok" : Math.abs(L.densErr) <= 8 ? "warn" : "bad";
   const densTxt = L.overallDensity
-    ? `${fmtDensity(L.overallDensity, r)} 根/${unitTxt}` +
+    ? `${fmtDensity(L.overallDensity)} 根/${unitTxt}` +
       (L.densErr !== null ? ` <span class="small">(${L.densErr >= 0 ? "+" : ""}${L.densErr.toFixed(1)}%)</span>` : "")
     : "—";
   const segLine = (nm, sd) =>
     `${nm} ${sd.ends}根/${sd.dents}齿 · ` +
-    (sd.density ? `${fmtDensity(sd.density, r)} 根/${unitTxt}` : "—");
+    (sd.density ? `${fmtDensity(sd.density)} 根/${unitTxt}` : "—");
   const overCls = L.overBody + L.overEdge ? "bad" : "ok";
   el.innerHTML = `
     <div class="reed-stat">总经数 <b>${L.E}</b> ｜ 已入筘 <b class="${L.placedEnds === L.E ? "ok" : "bad"}">${L.placedEnds}</b></div>
     <div class="reed-stat">幅宽内筘齿 <b>${L.available || "—"}</b> ｜ 实际占用 <b>${L.usedDents}</b>${L.tailEmpty ? ` <span class="small">余 ${L.tailEmpty} 空齿</span>` : ""}</div>
-    <div class="reed-stat">实际幅宽 <b>${L.actualWidth ? reedFromCm(L.actualWidth, r).toFixed(2) + " " + unitTxt : "—"}</b>${r.width ? ` <span class="small">目标 ${r.width}</span>` : ""}</div>
+    <div class="reed-stat">实际幅宽 <b>${L.actualWidth ? L.actualWidth.toFixed(2) + " " + unitTxt : "—"}</b>${r.width ? ` <span class="small">目标 ${r.width}</span>` : ""}</div>
     <div class="reed-stat ${errCls}">整体经密 <b>${densTxt}</b>${tgt ? ` <span class="small">目标 ${r.targetDensity}</span>` : ""}</div>
     <div class="reed-stat">${segLine("左边", L.segDensity.left)}</div>
     <div class="reed-stat">${segLine("地经", L.segDensity.body)}</div>
@@ -4363,18 +4362,20 @@ function commitReedEdit() {
   pushHistory();
 }
 
-/* 单位切换：在厘米/英寸间换算物理量，保持方案不变 */
+/* 单位切换：在厘米/英寸间换算，保持物理方案不变。
+   筘号/经密是“每单位长度”的计数：单位变小(cm)计数变大 → 乘 2.54；
+   幅宽是长度：cm→in 除 2.54，in→cm 乘 2.54。 */
 function switchReedUnit(to) {
   const r = state.reed;
   if (r.unit === to) return;
-  if (to === "in") {
-    r.reedNo = r.reedNo * CM_PER_IN;
+  if (to === "in") {                       // cm → in
+    r.reedNo = r.reedNo * CM_PER_IN;       // 每英寸计数 = 每厘米 × 2.54
     r.targetDensity = r.targetDensity * CM_PER_IN;
-    r.width = r.width * CM_PER_IN;
-  } else {
+    r.width = r.width / CM_PER_IN;         // 英寸 = 厘米 / 2.54
+  } else {                                 // in → cm
     r.reedNo = r.reedNo / CM_PER_IN;
     r.targetDensity = r.targetDensity / CM_PER_IN;
-    r.width = r.width / CM_PER_IN;
+    r.width = r.width * CM_PER_IN;
   }
   r.unit = to;
   r.status = "draft";
@@ -4437,13 +4438,12 @@ function reedCandCard(c, i, unitTxt) {
   const card = document.createElement("div");
   card.className = "reed-cand" + (i === 0 ? " sel" : "");
   const errCls = Math.abs(c.densErr) <= 3 ? "ok" : Math.abs(c.densErr) <= 8 ? "warn" : "bad";
-  const toUnit = (v) => state.reed.unit === "in" ? v * CM_PER_IN : v;
   card.innerHTML = `
     <div class="reed-cand-head">
       <b>候选 ${i + 1}：${c.seq.join("-")}</b>
       <span>循环 ${c.seq.length} 齿 · 均入 ${c.m.toFixed(2)}</span>
-      <span>幅宽 <b>${toUnit(c.width).toFixed(2)} ${unitTxt}</b></span>
-      <span class="${errCls}">经密 ${toUnit(c.density).toFixed(2)} 根/${unitTxt}
+      <span>幅宽 <b>${c.width.toFixed(2)} ${unitTxt}</b></span>
+      <span class="${errCls}">经密 ${c.density.toFixed(2)} 根/${unitTxt}
         （${c.densErr >= 0 ? "+" : ""}${c.densErr.toFixed(1)}%）</span>
       <span class="${c.over ? "bad" : "ok"}">超限齿 ${c.over}</span>
       <span class="small muted">疏密变化 ${c.jump} / 极差 ${c.spread}</span>
@@ -4494,7 +4494,7 @@ function printReedSheet() {
       <div style="transform-origin:0 0; transform:scale(${Math.min(1, 760 / svgW)})">${svg}</div></div>`;
   }
   const seg = L.segDensity;
-  const widthShown = reedFromCm(L.actualWidth, r);
+  const widthShown = L.actualWidth;
   let html = `<div class="print-sheet">
     <div class="print-reed-head">
       <b>${escapeHtml($("#projectName").value)} · 穿经单（穿综 / 穿筘 / 颜色）</b>
@@ -4505,7 +4505,7 @@ function printReedSheet() {
         入筘序列 ${escapeHtml(r.seq)}${r.edgeOn ? ` ｜ 边经每侧 ${r.edgeEnds} 根、序列 ${escapeHtml(r.edgeSeq)}` : ""}
       </div>
       <div class="print-reed-meta">
-        整体经密 ${fmtDensity(L.overallDensity, r)} 根/${unitTxt}（目标 ${r.targetDensity || "—"}）｜
+        整体经密 ${fmtDensity(L.overallDensity)} 根/${unitTxt}（目标 ${r.targetDensity || "—"}）｜
         左边 ${seg.left.ends}根/${seg.left.dents}齿 ｜ 地经 ${seg.body.ends}根/${seg.body.dents}齿 ｜ 右边 ${seg.right.ends}根/${seg.right.dents}齿 ｜
         打印日期 ${new Date().toLocaleDateString("zh-CN")}
       </div>
@@ -4556,9 +4556,11 @@ function round3(v) { return (Math.round((v || 0) * 100) / 100).toFixed(2); }
 /* ============================================================
    穿筘模块事件绑定（init 调用一次）
    ============================================================ */
+/* 只做一次：规范化数据 + 绑定事件。注意此刻 localStorage 草稿尚未恢复，
+   不能在这里 syncReedForm()，否则会用空表单随后覆盖恢复的参数；
+   表单回填统一在 init() 草稿恢复后调用 syncReedForm()。 */
 function initReed() {
   state.reed = normalizeReed(state.reed);
-  syncReedForm();
   bindReedDiagramEvents();
 
   $("#btnReedSearch").addEventListener("click", openReedSearch);
@@ -4736,11 +4738,14 @@ function init() {
     state.threading = d.threading; state.tieup = d.tieup; state.treadling = d.treadling;
     state.mode = "treadle";
     state.liftplan = new Set();
+    state.reed = normalizeReed(state.reed);
     $("#projectName").value = "示例·平纹";
   }
   syncSetupInputs();
   applyModeUI();
   rebuildAll();
+  // 草稿恢复/默认载入完成后，再把最终的穿筘参数与状态回填到表单并重绘
+  syncReedForm();
   history.stack = [snapshot()];
   history.index = 0;
   updateHistoryButtons();
